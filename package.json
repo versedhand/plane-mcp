@@ -1,0 +1,27 @@
+{
+  "name": "plane-mcp",
+  "version": "1.0.0",
+  "description": "Lean MCP server for Plane CE — direct PostgreSQL access for agents",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "plane-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "author": "Isaac Robinson",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "pg": "^8.13.0",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/pg": "^8.11.0",
+    "typescript": "^5.3.0"
+  }
+}
