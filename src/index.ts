@@ -1,24 +1,25 @@
 #!/usr/bin/env node
 
 /**
- * Lean Plane CE MCP Server
+ * Lean Plane CE MCP Server (Multi-Instance)
  *
- * Direct PostgreSQL access to Plane CE's database.
- * Agents get SQL-level efficiency; humans use Plane's web UI.
- * Same database, two interfaces.
+ * Direct PostgreSQL access to Plane CE databases.
+ * Supports multiple Plane instances (personal, nts) via `instance` param.
+ * Recurrence engine in LifeDB sidecar table.
  *
- * Env: PLANE_DB_HOST, PLANE_DB_PORT, PLANE_DB_USER, PLANE_DB_PASSWORD,
- *      PLANE_DB_NAME, PLANE_WORKSPACE_SLUG
+ * Env: PLANE_PERSONAL_DB_HOST, PLANE_NTS_DB_HOST, LIFEDB_URL, etc.
+ * Legacy: PLANE_DB_HOST (maps to personal instance)
  *
- * Tools (8):
+ * Tools (9):
  *   query           — Run arbitrary SELECT against Plane's database
  *   list_projects   — List projects with issue counts
  *   list_issues     — List issues with filters
  *   get_issue       — Get single issue with full details
  *   create_issue    — Create an issue
  *   update_issue    — Update issue fields
- *   complete_issue  — Mark issue(s) as complete
+ *   complete_issue  — Mark issue(s) as complete (triggers recurrence)
  *   search_issues   — Full-text search across issues
+ *   tasks_due       — Cross-instance view of due/overdue tasks
  */
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -34,23 +35,30 @@ import {
   completeIssue,
   searchIssues,
   rawQuery,
+  tasksDue,
 } from './queries.js';
+
+const instanceParam = z
+  .enum(['personal', 'nts'])
+  .optional()
+  .default('personal')
+  .describe('Plane instance: personal or nts (default: personal)');
 
 const server = new McpServer({
   name: 'plane',
-  version: '1.0.0',
+  version: '2.0.0',
 });
 
-// Tool: query
 server.tool(
   'query',
   'Run a read-only SQL query against the Plane database. Supports SELECT, WITH, EXPLAIN.',
   {
     sql: z.string().describe('SQL query (SELECT/WITH/EXPLAIN only)'),
+    instance: instanceParam,
   },
-  async ({ sql }) => {
+  async ({ sql, instance }) => {
     try {
-      const result = await rawQuery(sql);
+      const result = await rawQuery(sql, instance);
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -58,14 +66,15 @@ server.tool(
   },
 );
 
-// Tool: list_projects
 server.tool(
   'list_projects',
   'List all active projects in the workspace with open/total issue counts.',
-  {},
-  async () => {
+  {
+    instance: instanceParam,
+  },
+  async ({ instance }) => {
     try {
-      const result = await listProjects();
+      const result = await listProjects(instance);
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -73,10 +82,9 @@ server.tool(
   },
 );
 
-// Tool: list_issues
 server.tool(
   'list_issues',
-  'List issues with optional filters. Returns compact one-liner format: priority, ID, name, assignee, due date, state.',
+  'List issues with optional filters. Returns compact one-liner format.',
   {
     project: z.string().optional().describe('Project identifier or name'),
     state: z.string().optional().describe('State name or group (backlog/unstarted/started/completed/cancelled)'),
@@ -84,10 +92,11 @@ server.tool(
     priority: z.string().optional().describe('Priority: urgent, high, medium, low, none'),
     label: z.string().optional().describe('Label name (partial match)'),
     limit: z.number().optional().default(50).describe('Max issues to return (default 50)'),
+    instance: instanceParam,
   },
-  async (opts) => {
+  async ({ instance, ...opts }) => {
     try {
-      const result = await listIssues(opts);
+      const result = await listIssues({ ...opts, instance });
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -95,16 +104,16 @@ server.tool(
   },
 );
 
-// Tool: get_issue
 server.tool(
   'get_issue',
   'Get a single issue with full details including assignees, labels, description.',
   {
     issue_id: z.string().describe('Issue UUID'),
+    instance: instanceParam,
   },
-  async ({ issue_id }) => {
+  async ({ issue_id, instance }) => {
     try {
-      const result = await getIssue(issue_id);
+      const result = await getIssue(issue_id, instance);
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -112,7 +121,6 @@ server.tool(
   },
 );
 
-// Tool: create_issue
 server.tool(
   'create_issue',
   'Create a new issue in a project.',
@@ -125,10 +133,12 @@ server.tool(
     description: z.string().optional().describe('Issue description (plain text)'),
     target_date: z.string().optional().describe('Due date (YYYY-MM-DD)'),
     start_date: z.string().optional().describe('Start date (YYYY-MM-DD)'),
+    labels: z.array(z.string()).optional().describe('Label names to attach'),
+    instance: instanceParam,
   },
-  async (opts) => {
+  async ({ instance, ...opts }) => {
     try {
-      const result = await createIssue(opts);
+      const result = await createIssue({ ...opts, instance });
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -136,7 +146,6 @@ server.tool(
   },
 );
 
-// Tool: update_issue
 server.tool(
   'update_issue',
   'Update an existing issue. Only provided fields are changed.',
@@ -148,10 +157,11 @@ server.tool(
     assignee: z.string().optional().describe('New assignee name or email (empty string to unassign)'),
     target_date: z.string().optional().describe('New due date (YYYY-MM-DD, empty string to clear)'),
     start_date: z.string().optional().describe('New start date (YYYY-MM-DD, empty string to clear)'),
+    instance: instanceParam,
   },
-  async ({ issue_id, ...updates }) => {
+  async ({ issue_id, instance, ...updates }) => {
     try {
-      const result = await updateIssue(issue_id, updates);
+      const result = await updateIssue(issue_id, updates, instance);
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -159,16 +169,16 @@ server.tool(
   },
 );
 
-// Tool: complete_issue
 server.tool(
   'complete_issue',
-  'Mark one or more issues as complete. Sets state to the completed group and records completion timestamp.',
+  'Mark one or more issues as complete. Triggers recurrence if configured (spawns next instance automatically).',
   {
     issue_ids: z.array(z.string()).describe('Array of issue UUIDs to complete'),
+    instance: instanceParam,
   },
-  async ({ issue_ids }) => {
+  async ({ issue_ids, instance }) => {
     try {
-      const result = await completeIssue(issue_ids);
+      const result = await completeIssue(issue_ids, instance);
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -176,17 +186,37 @@ server.tool(
   },
 );
 
-// Tool: search_issues
 server.tool(
   'search_issues',
   'Search issues by text across names and descriptions.',
   {
     text: z.string().describe('Search text (case-insensitive partial match)'),
     limit: z.number().optional().default(20).describe('Max results (default 20)'),
+    instance: instanceParam,
   },
-  async ({ text, limit }) => {
+  async ({ text, limit, instance }) => {
     try {
-      const result = await searchIssues(text, limit);
+      const result = await searchIssues(text, limit, instance);
+      return { content: [{ type: 'text', text: result }] };
+    } catch (err: any) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+    }
+  },
+);
+
+server.tool(
+  'tasks_due',
+  'Get all tasks due today or overdue across instances. Returns compact format sorted by date and priority.',
+  {
+    instance: z
+      .enum(['personal', 'nts', 'all'])
+      .optional()
+      .default('all')
+      .describe('Instance to query: personal, nts, or all (default: all)'),
+  },
+  async ({ instance }) => {
+    try {
+      const result = await tasksDue(instance);
       return { content: [{ type: 'text', text: result }] };
     } catch (err: any) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
@@ -201,7 +231,6 @@ async function main() {
   await server.connect(transport);
 }
 
-// Graceful shutdown
 process.on('SIGINT', async () => {
   await shutdown();
   process.exit(0);
