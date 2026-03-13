@@ -1,17 +1,41 @@
 {
-  "name": "plane-mcp",
+  "name": "@versedhand/plane-mcp",
   "version": "1.0.0",
-  "description": "Lean MCP server for Plane CE — direct PostgreSQL access for agents",
+  "description": "Lean MCP server for Plane CE — direct PostgreSQL access for AI agents. 8 tools, ~1600 token schema footprint.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "plane-mcp": "dist/index.js"
   },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts",
+    "!dist/**/*.test.*",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "mcp",
+    "plane",
+    "plane-ce",
+    "model-context-protocol",
+    "ai-agents",
+    "project-management",
+    "claude"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/versedhand/plane-mcp.git"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "author": "Isaac Robinson",
   "license": "MIT",

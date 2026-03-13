@@ -119,7 +119,7 @@ export function getLifedbPool(): pg.Pool {
       lifedbPool = new Pool({ connectionString: url, max: 3, idleTimeoutMillis: 30000 });
     } else {
       lifedbPool = new Pool({
-        host: process.env.LIFEDB_HOST || '100.127.104.75',
+        host: process.env.LIFEDB_HOST || 'localhost',
         port: parseInt(process.env.LIFEDB_PORT || '5432', 10),
         user: process.env.LIFEDB_USER || 'postgres',
         password: process.env.LIFEDB_PASSWORD,
