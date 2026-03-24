@@ -507,14 +507,22 @@ interface RecurrenceRule {
 
 async function processRecurrenceIfExists(issueId: string, instance: InstanceName): Promise<string | null> {
   const lifedb = getLifedbPool();
-  const rows = await lifedb.query(
-    `SELECT * FROM plane_recurrence WHERE plane_issue_id = $1 AND enabled = true`,
-    [issueId],
-  );
-  if (rows.rows.length === 0) return null;
+  try {
+    const rows = await lifedb.query(
+      `SELECT * FROM plane_recurrence WHERE plane_issue_id = $1 AND enabled = true`,
+      [issueId],
+    );
+    if (rows.rows.length === 0) return null;
 
-  const rule = rows.rows[0] as RecurrenceRule;
-  return processRecurrence(rule);
+    const rule = rows.rows[0] as RecurrenceRule;
+    return processRecurrence(rule);
+  } catch (err: any) {
+    // Table may not exist yet (created on-demand when first recurrence rule is added)
+    if (err.message?.includes('does not exist')) {
+      return null;
+    }
+    throw err;
+  }
 }
 
 async function processRecurrence(rule: RecurrenceRule): Promise<string> {
