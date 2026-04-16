@@ -6,9 +6,12 @@ Lean MCP server for [Plane CE](https://plane.so) — direct PostgreSQL access fo
 
 ## Architecture
 
-- **Agents** connect via plane-mcp → direct PostgreSQL queries (fast, low-token)
+- **Reads** go direct to PostgreSQL (fast, no API overhead)
+- **Mutations** go through Plane's REST API (triggers email notifications, activity logs, webhooks)
 - **Humans** use Plane CE web UI (boards, Gantt, dashboards)
-- **Same database** — both interfaces read/write the same PostgreSQL instance
+- **Fallback**: if API credentials aren't configured, mutations fall back to direct SQL (no notifications)
+
+When `PLANE_*_API_URL` and `PLANE_*_API_KEY` are set, `create_issue`, `update_issue`, and `complete_issue` use the REST API at `/api/v1/workspaces/{slug}/projects/{id}/work-items/`. All read operations (`list_issues`, `get_issue`, `search_issues`, `query`) always use direct SQL.
 
 ## Tools
 
@@ -59,7 +62,16 @@ host plane plane_mcp 0.0.0.0/0 md5
 
 Reload: `docker exec plane-plane-db-1 pg_ctl reload -D /var/lib/postgresql/data`
 
-### 3. Configure MCP
+### 3. Create API token
+
+In the Plane web UI, go to Profile Settings > Personal Access Tokens and create a token. Or create one in the database:
+
+```sql
+INSERT INTO api_tokens (id, token, label, user_type, user_id, workspace_id, description, is_active, is_service, created_at, updated_at, allowed_rate_limit)
+VALUES (gen_random_uuid(), 'plane_api_<hex>', 'mcp-server', 0, '<user-uuid>', '<workspace-uuid>', 'MCP server', true, false, NOW(), NOW(), '60/minute');
+```
+
+### 4. Configure MCP
 
 In `.mcp.json`:
 
@@ -67,22 +79,26 @@ In `.mcp.json`:
 {
   "mcpServers": {
     "plane": {
-      "command": "node",
-      "args": ["/path/to/plane-mcp/dist/index.js"],
+      "command": "npx",
+      "args": ["-y", "@versedhand/plane-mcp"],
       "env": {
-        "PLANE_DB_HOST": "127.0.0.1",
-        "PLANE_DB_PORT": "5432",
-        "PLANE_DB_USER": "plane_mcp",
-        "PLANE_DB_PASSWORD": "...",
-        "PLANE_DB_NAME": "plane",
-        "PLANE_WORKSPACE_SLUG": "personal"
+        "PLANE_PERSONAL_DB_HOST": "127.0.0.1",
+        "PLANE_PERSONAL_DB_PORT": "5432",
+        "PLANE_PERSONAL_DB_USER": "plane_mcp",
+        "PLANE_PERSONAL_DB_PASSWORD": "...",
+        "PLANE_PERSONAL_DB_NAME": "plane",
+        "PLANE_PERSONAL_WORKSPACE_SLUG": "personal",
+        "PLANE_PERSONAL_API_URL": "https://plane.example.com",
+        "PLANE_PERSONAL_API_KEY": "plane_api_..."
       }
     }
   }
 }
 ```
 
-### 4. Build
+The `API_URL` and `API_KEY` are optional. Without them, mutations fall back to direct SQL (no notifications).
+
+### 5. Build
 
 ```bash
 npm install

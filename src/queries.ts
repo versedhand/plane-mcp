@@ -1,5 +1,6 @@
 import { query, execute, getWorkspaceSlug, getAvailableInstances, getLifedbPool } from './db.js';
 import type { InstanceName } from './db.js';
+import { hasApiConfig, apiCreateWorkItem, apiUpdateWorkItem } from './api.js';
 import { randomUUID } from 'crypto';
 
 // Cache workspace IDs per instance
@@ -211,16 +212,7 @@ export async function createIssue(opts: {
   const projectId = projects[0].id;
   const projectIdentifier = projects[0].identifier;
 
-  // Advisory lock + sequence
-  await execute(`SELECT pg_advisory_lock(hashtext($1::text))`, [projectId], inst);
-  const seqRows = await query(
-    `SELECT COALESCE(MAX(sequence_id), 0) + 1 as next_seq FROM issues WHERE project_id = $1`,
-    [projectId],
-    inst,
-  );
-  const nextSeq = seqRows[0].next_seq;
-
-  // Resolve state
+  // Resolve state (needed for both API and SQL paths)
   let stateId: string;
   if (opts.state) {
     const states = await query(
@@ -252,14 +244,67 @@ export async function createIssue(opts: {
     }
   }
 
+  // Resolve assignee to user UUID (needed for both paths)
+  let assigneeId: string | null = null;
+  if (opts.assignee) {
+    const users = await query(
+      `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
+      [`%${opts.assignee}%`],
+      inst,
+    );
+    if (users.length > 0) assigneeId = users[0].id;
+  }
+
+  // Resolve label names to UUIDs (needed for both paths)
+  const labelIds: string[] = [];
+  if (opts.labels && opts.labels.length > 0) {
+    for (const labelName of opts.labels) {
+      const lblRows = await query(
+        `SELECT id FROM labels WHERE workspace_id = $1 AND name ILIKE $2 AND deleted_at IS NULL LIMIT 1`,
+        [wsId, labelName],
+        inst,
+      );
+      if (lblRows.length > 0) labelIds.push(lblRows[0].id);
+    }
+  }
+
+  const descText = opts.description || '';
+  const descHtml = descText ? `<p>${descText}</p>` : '';
+
+  // --- REST API path (preferred: triggers notifications) ---
+  if (hasApiConfig(inst)) {
+    const result = await apiCreateWorkItem(
+      projectId,
+      {
+        name: opts.name,
+        priority: opts.priority || 'none',
+        state: stateId,
+        assignees: assigneeId ? [assigneeId] : undefined,
+        labels: labelIds.length > 0 ? labelIds : undefined,
+        description_html: descHtml || undefined,
+        start_date: opts.start_date || null,
+        target_date: opts.target_date || null,
+      },
+      inst,
+    );
+    return `Created ${projectIdentifier}-${result.sequence_id}: ${opts.name} (id: ${result.id})`;
+  }
+
+  // --- SQL fallback (no API configured) ---
+  await execute(`SELECT pg_advisory_lock(hashtext($1::text))`, [projectId], inst);
+  const seqRows = await query(
+    `SELECT COALESCE(MAX(sequence_id), 0) + 1 as next_seq FROM issues WHERE project_id = $1`,
+    [projectId],
+    inst,
+  );
+  const nextSeq = seqRows[0].next_seq;
+
   const issueId = randomUUID();
   const now = new Date().toISOString();
 
-  const descText = opts.description || '';
   const descJson = descText
     ? JSON.stringify({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: descText }] }] })
     : '{}';
-  const descHtml = descText ? `<p>${descText}</p>` : '';
 
   await execute(
     `INSERT INTO issues (id, name, description, description_html, description_stripped, priority, state_id,
@@ -285,43 +330,24 @@ export async function createIssue(opts: {
     inst,
   );
 
-  // Handle assignee
-  if (opts.assignee) {
-    const users = await query(
-      `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
-      [`%${opts.assignee}%`],
+  if (assigneeId) {
+    await execute(
+      `INSERT INTO issue_assignees (id, issue_id, assignee_id, project_id, workspace_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+      [randomUUID(), issueId, assigneeId, projectId, wsId, now],
       inst,
     );
-    if (users.length > 0) {
-      await execute(
-        `INSERT INTO issue_assignees (id, issue_id, assignee_id, project_id, workspace_id, created_at, updated_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-        [randomUUID(), issueId, users[0].id, projectId, wsId, now],
-        inst,
-      );
-    }
   }
 
-  // Handle labels
-  if (opts.labels && opts.labels.length > 0) {
-    for (const labelName of opts.labels) {
-      const lblRows = await query(
-        `SELECT id FROM labels WHERE workspace_id = $1 AND name ILIKE $2 AND deleted_at IS NULL LIMIT 1`,
-        [wsId, labelName],
-        inst,
-      );
-      if (lblRows.length > 0) {
-        await execute(
-          `INSERT INTO issue_labels (id, issue_id, label_id, project_id, workspace_id, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-          [randomUUID(), issueId, lblRows[0].id, projectId, wsId, now],
-          inst,
-        );
-      }
-    }
+  for (const labelId of labelIds) {
+    await execute(
+      `INSERT INTO issue_labels (id, issue_id, label_id, project_id, workspace_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+      [randomUUID(), issueId, labelId, projectId, wsId, now],
+      inst,
+    );
   }
 
-  // Issue sequence record
   await execute(
     `INSERT INTO issue_sequences (id, issue_id, project_id, workspace_id, sequence, deleted, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, false, $6, $6)`,
@@ -346,6 +372,69 @@ export async function updateIssue(
   },
   instance: InstanceName = 'personal',
 ): Promise<string> {
+  // Look up issue's project (needed for both paths)
+  const issueRows = await query(
+    `SELECT i.project_id, i.workspace_id, p.identifier as project_identifier, i.sequence_id
+     FROM issues i JOIN projects p ON i.project_id = p.id
+     WHERE i.id = $1 AND i.deleted_at IS NULL`,
+    [issueId],
+    instance,
+  );
+  if (issueRows.length === 0) return 'Issue not found.';
+  const { project_id: projectId, project_identifier: projectIdentifier, sequence_id: seqId } = issueRows[0];
+
+  // Resolve state name/group to UUID if provided
+  let stateId: string | undefined;
+  if (updates.state) {
+    const states = await query(
+      `SELECT id, "group" FROM states WHERE project_id = $1 AND deleted_at IS NULL
+       AND (name ILIKE $2 OR "group" = $2) ORDER BY sequence LIMIT 1`,
+      [projectId, updates.state],
+      instance,
+    );
+    if (states.length > 0) stateId = states[0].id;
+  }
+
+  // Resolve assignee name/email to UUID if provided
+  let assigneeIds: string[] | undefined;
+  if (updates.assignee !== undefined) {
+    if (updates.assignee === '') {
+      assigneeIds = []; // unassign
+    } else {
+      const users = await query(
+        `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
+        [`%${updates.assignee}%`],
+        instance,
+      );
+      if (users.length > 0) {
+        // Preserve existing assignees and add the new one
+        const existing = await query(
+          `SELECT assignee_id FROM issue_assignees WHERE issue_id = $1 AND deleted_at IS NULL`,
+          [issueId],
+          instance,
+        );
+        const existingIds = existing.map((r: any) => r.assignee_id as string);
+        const newId = users[0].id;
+        assigneeIds = existingIds.includes(newId) ? existingIds : [...existingIds, newId];
+      }
+    }
+  }
+
+  // --- REST API path (preferred: triggers notifications) ---
+  if (hasApiConfig(instance)) {
+    const apiParams: Record<string, any> = {};
+    if (updates.name !== undefined) apiParams.name = updates.name;
+    if (updates.priority !== undefined) apiParams.priority = updates.priority;
+    if (stateId !== undefined) apiParams.state = stateId;
+    if (assigneeIds !== undefined) apiParams.assignees = assigneeIds;
+    if (updates.target_date !== undefined) apiParams.target_date = updates.target_date || null;
+    if (updates.start_date !== undefined) apiParams.start_date = updates.start_date || null;
+
+    await apiUpdateWorkItem(projectId, issueId, apiParams, instance);
+    return `Updated ${projectIdentifier}-${seqId}`;
+  }
+
+  // --- SQL fallback ---
   const now = new Date().toISOString();
   const setClauses: string[] = [`updated_at = $2`];
   const params: any[] = [issueId, now];
@@ -375,26 +464,19 @@ export async function updateIssue(
     paramIdx++;
   }
 
-  if (updates.state) {
-    const issue = await query(`SELECT project_id FROM issues WHERE id = $1`, [issueId], instance);
-    if (issue.length === 0) return 'Issue not found.';
+  if (stateId) {
+    setClauses.push(`state_id = $${paramIdx}`);
+    params.push(stateId);
+    paramIdx++;
 
-    const states = await query(
-      `SELECT id, "group" FROM states WHERE project_id = $1 AND deleted_at IS NULL
-       AND (name ILIKE $2 OR "group" = $2) ORDER BY sequence LIMIT 1`,
-      [issue[0].project_id, updates.state],
-      instance,
+    // Check if this is a completed state
+    const stateGroup = await query(
+      `SELECT "group" FROM states WHERE id = $1`, [stateId], instance,
     );
-    if (states.length > 0) {
-      setClauses.push(`state_id = $${paramIdx}`);
-      params.push(states[0].id);
+    if (stateGroup.length > 0 && stateGroup[0].group === 'completed') {
+      setClauses.push(`completed_at = $${paramIdx}`);
+      params.push(now);
       paramIdx++;
-
-      if (states[0].group === 'completed') {
-        setClauses.push(`completed_at = $${paramIdx}`);
-        params.push(now);
-        paramIdx++;
-      }
     }
   }
 
@@ -405,28 +487,25 @@ export async function updateIssue(
   );
 
   if (updates.assignee !== undefined) {
-    const issue = await query(`SELECT project_id, workspace_id FROM issues WHERE id = $1`, [issueId], instance);
-    if (issue.length > 0) {
-      await execute(
-        `UPDATE issue_assignees SET deleted_at = $2 WHERE issue_id = $1 AND deleted_at IS NULL`,
-        [issueId, now],
+    await execute(
+      `UPDATE issue_assignees SET deleted_at = $2 WHERE issue_id = $1 AND deleted_at IS NULL`,
+      [issueId, now],
+      instance,
+    );
+
+    if (updates.assignee) {
+      const users = await query(
+        `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
+        [`%${updates.assignee}%`],
         instance,
       );
-
-      if (updates.assignee) {
-        const users = await query(
-          `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
-          [`%${updates.assignee}%`],
+      if (users.length > 0) {
+        await execute(
+          `INSERT INTO issue_assignees (id, issue_id, assignee_id, project_id, workspace_id, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+          [randomUUID(), issueId, users[0].id, projectId, issueRows[0].workspace_id, now],
           instance,
         );
-        if (users.length > 0) {
-          await execute(
-            `INSERT INTO issue_assignees (id, issue_id, assignee_id, project_id, workspace_id, created_at, updated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $6)`,
-            [randomUUID(), issueId, users[0].id, issue[0].project_id, issue[0].workspace_id, now],
-            instance,
-          );
-        }
       }
     }
   }
@@ -437,6 +516,7 @@ export async function updateIssue(
 export async function completeIssue(issueIds: string[], instance: InstanceName = 'personal'): Promise<string> {
   const now = new Date().toISOString();
   const results: string[] = [];
+  const useApi = hasApiConfig(instance);
 
   for (const issueId of issueIds) {
     const issue = await query(
@@ -462,12 +542,23 @@ export async function completeIssue(issueIds: string[], instance: InstanceName =
       continue;
     }
 
-    await execute(
-      `UPDATE issues SET state_id = $2, completed_at = $3, updated_at = $3
-       WHERE id = $1 AND deleted_at IS NULL`,
-      [issueId, states[0].id, now],
-      instance,
-    );
+    if (useApi) {
+      // REST API path — Plane handles completed_at automatically when state group is 'completed'
+      await apiUpdateWorkItem(
+        issue[0].project_id,
+        issueId,
+        { state: states[0].id },
+        instance,
+      );
+    } else {
+      // SQL fallback
+      await execute(
+        `UPDATE issues SET state_id = $2, completed_at = $3, updated_at = $3
+         WHERE id = $1 AND deleted_at IS NULL`,
+        [issueId, states[0].id, now],
+        instance,
+      );
+    }
 
     results.push(`${issue[0].identifier}-${issue[0].sequence_id}: ${issue[0].name} -> completed`);
 
