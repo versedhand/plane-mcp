@@ -473,7 +473,7 @@ export async function updateIssue(
     const stateGroup = await query(
       `SELECT "group" FROM states WHERE id = $1`, [stateId], instance,
     );
-    if (stateGroup.length > 0 && stateGroup[0].group === 'completed') {
+    if (stateGroup.length > 0 && (stateGroup[0].group === 'completed' || stateGroup[0].group === 'cancelled')) {
       setClauses.push(`completed_at = $${paramIdx}`);
       params.push(now);
       paramIdx++;
