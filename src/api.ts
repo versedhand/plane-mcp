@@ -90,10 +90,11 @@ async function apiRequest(
   const resp = await fetch(url, fetchOpts);
   let data: any = null;
   if (resp.status !== 204) {
+    const text = await resp.text();
     try {
-      data = await resp.json();
+      data = JSON.parse(text);
     } catch {
-      data = await resp.text();
+      data = text;
     }
   }
 
