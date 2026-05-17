@@ -743,25 +743,38 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
   for (const inst of instances) {
     try {
       const wsId = await getWorkspaceId(inst);
+      // Get the workspace owner (first user by creation) to filter to their tasks
+      const ownerRows = await query(
+        `SELECT u.id FROM workspace_members wm
+         JOIN users u ON wm.member_id = u.id
+         WHERE wm.workspace_id = $1 AND wm.role = 20
+         ORDER BY wm.created_at ASC LIMIT 1`,
+        [wsId],
+        inst,
+      );
+      const ownerId = ownerRows.length > 0 ? ownerRows[0].id : null;
+
       const rows = await query(
-        `SELECT i.id, i.name, i.priority, i.sequence_id,
+        `SELECT DISTINCT i.id, i.name, i.priority, i.sequence_id,
                 i.target_date,
                 s.name as state_name,
                 p.identifier as project_identifier
          FROM issues i
          JOIN states s ON i.state_id = s.id
          JOIN projects p ON i.project_id = p.id
+         JOIN issue_assignees ia ON ia.issue_id = i.id AND ia.deleted_at IS NULL
          WHERE i.workspace_id = $1
            AND i.deleted_at IS NULL AND i.archived_at IS NULL
            AND s.group NOT IN ('completed', 'cancelled')
            AND i.target_date <= CURRENT_DATE
+           AND ($2::uuid IS NULL OR ia.assignee_id = $2)
          ORDER BY
            i.target_date,
            CASE i.priority
              WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
              WHEN 'low' THEN 3 ELSE 4
            END`,
-        [wsId],
+        [wsId, ownerId],
         inst,
       );
 
