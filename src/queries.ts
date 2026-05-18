@@ -745,20 +745,23 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
       const wsId = await getWorkspaceId(inst);
 
       const rows = await query(
-        `SELECT DISTINCT i.id, i.name, i.priority, i.sequence_id,
+        `SELECT i.id, i.name, i.priority, i.sequence_id,
                 i.target_date,
                 s.name as state_name,
                 p.identifier as project_identifier
          FROM issues i
          JOIN states s ON i.state_id = s.id
          JOIN projects p ON i.project_id = p.id
-         JOIN issue_assignees ia ON ia.issue_id = i.id AND ia.deleted_at IS NULL
-         JOIN users u ON ia.assignee_id = u.id
          WHERE i.workspace_id = $1
            AND i.deleted_at IS NULL AND i.archived_at IS NULL
            AND s.group NOT IN ('completed', 'cancelled')
            AND i.target_date <= CURRENT_DATE
-           AND u.email = 'isaac@rirobinson.com'
+           AND EXISTS (
+             SELECT 1 FROM issue_assignees ia
+             JOIN users u ON ia.assignee_id = u.id
+             WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL
+             AND u.email = 'isaac@rirobinson.com'
+           )
          ORDER BY
            i.target_date,
            CASE i.priority
@@ -774,8 +777,8 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
         const overdue = r.target_date < new Date().toISOString().split('T')[0] ? ' OVERDUE' : '';
         allLines.push(`${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | Due: ${r.target_date}${overdue} | ${r.state_name} [${inst}]`);
       }
-    } catch {
-      // Instance might not be configured; skip
+    } catch (err: any) {
+      allLines.push(`[ERROR ${inst}]: ${err.message}`);
     }
   }
 
