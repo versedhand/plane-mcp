@@ -392,7 +392,18 @@ export async function updateIssue(
       [projectId, updates.state],
       instance,
     );
-    if (states.length > 0) stateId = states[0].id;
+    if (states.length > 0) {
+      stateId = states[0].id;
+    } else {
+      // Fallback: project has no states — search workspace-wide for a matching state
+      const fallbackStates = await query(
+        `SELECT id, "group" FROM states WHERE workspace_id = $1 AND deleted_at IS NULL
+         AND (name ILIKE $2 OR "group" = $2) ORDER BY sequence LIMIT 1`,
+        [issueRows[0].workspace_id, updates.state],
+        instance,
+      );
+      if (fallbackStates.length > 0) stateId = fallbackStates[0].id;
+    }
   }
 
   // Resolve assignee name/email to UUID if provided
@@ -531,12 +542,26 @@ export async function completeIssue(issueIds: string[], instance: InstanceName =
       continue;
     }
 
-    const states = await query(
+    let states = await query(
       `SELECT id FROM states WHERE project_id = $1 AND deleted_at IS NULL
        AND "group" = 'completed' ORDER BY sequence LIMIT 1`,
       [issue[0].project_id],
       instance,
     );
+    if (states.length === 0) {
+      // Fallback: project has no states — search workspace-wide
+      const wsRows = await query(
+        `SELECT workspace_id FROM issues WHERE id = $1`, [issueId], instance,
+      );
+      if (wsRows.length > 0) {
+        states = await query(
+          `SELECT id FROM states WHERE workspace_id = $1 AND deleted_at IS NULL
+           AND "group" = 'completed' ORDER BY sequence LIMIT 1`,
+          [wsRows[0].workspace_id],
+          instance,
+        );
+      }
+    }
     if (states.length === 0) {
       results.push(`${issue[0].identifier}-${issue[0].sequence_id}: no completed state found`);
       continue;
