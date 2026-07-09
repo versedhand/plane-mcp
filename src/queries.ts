@@ -769,11 +769,21 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
     try {
       const wsId = await getWorkspaceId(inst);
 
+      // No assignee filter: the tool contract is "all tasks due/overdue".
+      // A previous version filtered to assignee email isaac@rirobinson.com,
+      // which silently returned zero once NTS assignments moved to the
+      // isaac@versedhand.com user (and personal tasks were unassigned).
       const rows = await query(
         `SELECT i.id, i.name, i.priority, i.sequence_id,
                 i.target_date,
                 s.name as state_name,
-                p.identifier as project_identifier
+                p.identifier as project_identifier,
+                COALESCE(
+                  (SELECT string_agg(u.first_name, ', ')
+                   FROM issue_assignees ia JOIN users u ON ia.assignee_id = u.id
+                   WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL),
+                  'unassigned'
+                ) as assignees
          FROM issues i
          JOIN states s ON i.state_id = s.id
          JOIN projects p ON i.project_id = p.id
@@ -781,12 +791,6 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
            AND i.deleted_at IS NULL AND i.archived_at IS NULL
            AND s.group NOT IN ('completed', 'cancelled')
            AND i.target_date <= CURRENT_DATE
-           AND EXISTS (
-             SELECT 1 FROM issue_assignees ia
-             JOIN users u ON ia.assignee_id = u.id
-             WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL
-             AND u.email = 'isaac@rirobinson.com'
-           )
          ORDER BY
            i.target_date,
            CASE i.priority
@@ -800,7 +804,7 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
       for (const r of rows) {
         const priority = r.priority === 'none' ? '' : `[${r.priority.toUpperCase()}] `;
         const overdue = r.target_date < new Date().toISOString().split('T')[0] ? ' OVERDUE' : '';
-        allLines.push(`${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | Due: ${r.target_date}${overdue} | ${r.state_name} [${inst}]`);
+        allLines.push(`${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | ${r.assignees} | Due: ${r.target_date}${overdue} | ${r.state_name} [${inst}]`);
       }
     } catch (err: any) {
       allLines.push(`[ERROR ${inst}]: ${err.message}`);
