@@ -357,7 +357,61 @@ export async function createIssue(opts: {
 
   await execute(`SELECT pg_advisory_unlock(hashtext($1::text))`, [projectId], inst);
 
-  return `Created ${projectIdentifier}-${nextSeq}: ${opts.name} (id: ${issueId})`;
+  // READ-BACK VERIFICATION (added 2026-07-31).
+  //
+  // WHY: this function used to return "Created X" the moment the inserts were
+  // issued — a success message written by the layer that REQUESTED the action,
+  // never by the layer that observed its effect. Concretely, label resolution
+  // above does `if (lblRows.length > 0) labelIds.push(...)`, so an unknown label
+  // name is SILENTLY DROPPED: the caller asks for a label, gets "Created X", and
+  // the issue has no label. That is exactly what happened to the mandated
+  // `research-review` label — every agent that "complied" produced an unlabelled
+  // task and reported success, for months.
+  //
+  // So: query the issue back and report what ACTUALLY attached. This catches
+  // unresolved names AND any future silent drop nobody anticipated, because it
+  // compares requested against observed rather than against expectations.
+  const notes: string[] = [];
+  try {
+    const gotLabels = await query(
+      `SELECT l.name FROM issue_labels il JOIN labels l ON l.id = il.label_id
+       WHERE il.issue_id = $1`,
+      [issueId],
+      inst,
+    );
+    const gotNames = gotLabels.map((r: { name: string }) => r.name);
+    const wanted = opts.labels ?? [];
+    const missing = wanted.filter(
+      (w) => !gotNames.some((g: string) => g.toLowerCase() === w.toLowerCase()),
+    );
+    if (missing.length > 0) {
+      notes.push(
+        `⚠️ LABEL(S) NOT ATTACHED: ${missing.join(', ')} — no such label in this workspace, so it was dropped. ` +
+          `Create the label in Plane first, or omit it. Attached: ${gotNames.length ? gotNames.join(', ') : 'none'}.`,
+      );
+    }
+
+    if (opts.assignee) {
+      const gotAssignees = await query(
+        `SELECT u.email FROM issue_assignees ia JOIN users u ON u.id = ia.assignee_id
+         WHERE ia.issue_id = $1`,
+        [issueId],
+        inst,
+      );
+      if (gotAssignees.length === 0) {
+        notes.push(
+          `⚠️ ASSIGNEE NOT SET: "${opts.assignee}" matched no user — the issue is UNASSIGNED. ` +
+            `Unassigned tasks are invisible tasks.`,
+        );
+      }
+    }
+  } catch (e) {
+    // Fail LOUD, never silent: an unverifiable create must not read like a clean one.
+    notes.push(`⚠️ READ-BACK FAILED (${e instanceof Error ? e.message : String(e)}) — attributes UNVERIFIED.`);
+  }
+
+  const base = `Created ${projectIdentifier}-${nextSeq}: ${opts.name} (id: ${issueId})`;
+  return notes.length > 0 ? `${base}\n${notes.join('\n')}` : base;
 }
 
 export async function updateIssue(
