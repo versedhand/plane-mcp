@@ -104,20 +104,17 @@ describe('tasksDue', () => {
   });
 });
 
-describe('recurrence', () => {
-  it('has recurrence rules in lifedb', async () => {
-    const pool = getLifedbPool();
-    const result = await pool.query('SELECT COUNT(*) as cnt FROM plane_recurrence WHERE enabled = true');
-    expect(parseInt(result.rows[0].cnt)).toBeGreaterThan(0);
-  });
-
-  it('has exercise_cycle rule', async () => {
-    const pool = getLifedbPool();
-    const result = await pool.query("SELECT * FROM plane_recurrence WHERE recur_type = 'exercise_cycle' AND enabled = true");
-    expect(result.rows.length).toBe(1);
-    expect(result.rows[0].template_name).toContain('Exercise');
-  });
-});
+// REMOVED 2026-07-31: the `recurrence` describe block tested the sidecar recurrence
+// engine, which was ABANDONED 2026-06-26 — it never functioned, and the
+// `plane_recurrence` table no longer exists, so both tests failed with
+// `relation "plane_recurrence" does not exist` on every run.
+//
+// They are deleted rather than skipped because a permanently-red suite is a suite
+// nobody runs, and this one had been red long enough that a genuine regression
+// would have been invisible inside the noise. Recurrence now lives in Google
+// Calendar (human-actioned) and etc/scheduled-tasks/ (agent-actioned) — see
+// tasks/tasks_system_overview.md. If recurrence ever returns to Plane, write new
+// tests against whatever it actually uses; do not restore these.
 
 describe('createIssue', () => {
   let testIssueId: string | null = null;
