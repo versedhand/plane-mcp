@@ -1,7 +1,7 @@
 {
   "name": "@versedhand/plane-mcp",
-  "version": "1.1.7",
-  "description": "Lean MCP server for Plane CE — direct PostgreSQL access for AI agents. 8 tools, ~1600 token schema footprint.",
+  "version": "1.2.0",
+  "description": "Lean MCP server for Plane CE \u2014 direct PostgreSQL access for AI agents. 8 tools, ~1600 token schema footprint.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

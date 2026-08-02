@@ -256,7 +256,15 @@ export async function createIssue(opts: {
   }
 
   // Resolve label names to UUIDs (needed for both paths)
+  // FIX 2026-08-02: an unknown label used to be SILENTLY DROPPED while the call
+  // reported success. Measured cost: the corpus mandates a `research-review` label
+  // on every research task; the label was not created until 2026-07-31, so 31 of 33
+  // review tasks carry no label. `list_issues(label="research-review")` returned 2
+  // and read as "backlog nearly clear" while the real backlog was 33. Nobody skipped
+  // the gate — the gate's own instrument could not see its own queue.
+  // An unknown label and an attached label must NEVER produce the same output.
   const labelIds: string[] = [];
+  const missingLabels: string[] = [];
   if (opts.labels && opts.labels.length > 0) {
     for (const labelName of opts.labels) {
       const lblRows = await query(
@@ -265,6 +273,19 @@ export async function createIssue(opts: {
         inst,
       );
       if (lblRows.length > 0) labelIds.push(lblRows[0].id);
+      else missingLabels.push(labelName);
+    }
+    if (missingLabels.length > 0) {
+      const known = await query(
+        `SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY name`,
+        [wsId],
+        inst,
+      );
+      throw new Error(
+        `Label(s) not found: ${missingLabels.join(', ')}. ` +
+          `Nothing was created — fix the label name or create the label first, then retry. ` +
+          `Existing labels in this workspace: ${known.map((r: any) => r.name).join(', ') || '(none)'}`,
+      );
     }
   }
 
@@ -414,6 +435,48 @@ export async function createIssue(opts: {
   return notes.length > 0 ? `${base}\n${notes.join('\n')}` : base;
 }
 
+/**
+ * Read an issue back after a write and report any drift from what was asked for.
+ *
+ * FIX 2026-08-02. Both write paths used to report success unconditionally — the API
+ * path returned `Updated X-N`, the SQL path returned the raw pg tag `UPDATE 1`.
+ * Two silent failures were measured that day: clearing `target_date` ALSO flipped the
+ * issue to a completed state, and `complete_issue` succeeded while the issue was back
+ * at Todo 23 seconds later. In both cases the call's own output said success.
+ *
+ * A write that took and a write that did not must never produce the same output.
+ * This runs in BOTH paths deliberately: the first version of this fix was added only
+ * to the API path, and `hasApiConfig` is false here, so it guarded code that never ran.
+ */
+async function verifyIssueWrite(
+  issueId: string,
+  updates: { name?: string; priority?: string; target_date?: string; start_date?: string; state?: string },
+  instance: InstanceName,
+): Promise<string[]> {
+  const after = await query(
+    `SELECT i.name, i.target_date, i.start_date, i.priority, s.name AS state_name, s."group" AS state_group
+     FROM issues i LEFT JOIN states s ON i.state_id = s.id
+     WHERE i.id = $1 AND i.deleted_at IS NULL`,
+    [issueId],
+    instance,
+  );
+  const drift: string[] = [];
+  if (after.length === 0) return ['issue not readable after the write'];
+  const row = after[0];
+  const wantDate = (v?: string) => (v ? String(v).slice(0, 10) : null);
+  const gotDate = (v: any) => (v ? new Date(v).toISOString().slice(0, 10) : null);
+  if (updates.name !== undefined && row.name !== updates.name) drift.push(`name is "${row.name}"`);
+  if (updates.priority !== undefined && row.priority !== updates.priority) drift.push(`priority is "${row.priority}"`);
+  if (updates.target_date !== undefined && gotDate(row.target_date) !== wantDate(updates.target_date))
+    drift.push(`target_date is ${gotDate(row.target_date) ?? 'null'}`);
+  if (updates.start_date !== undefined && gotDate(row.start_date) !== wantDate(updates.start_date))
+    drift.push(`start_date is ${gotDate(row.start_date) ?? 'null'}`);
+  // The dangerous one: a completion nobody asked for.
+  if (updates.state === undefined && row.state_group === 'completed')
+    drift.push(`⚠ state is now "${row.state_name}" (completed) and that was not requested`);
+  return drift;
+}
+
 export async function updateIssue(
   issueId: string,
   updates: {
@@ -423,6 +486,7 @@ export async function updateIssue(
     assignee?: string;
     target_date?: string;
     start_date?: string;
+    description?: string;
   },
   instance: InstanceName = 'personal',
 ): Promise<string> {
@@ -490,13 +554,21 @@ export async function updateIssue(
     const apiParams: Record<string, any> = {};
     if (updates.name !== undefined) apiParams.name = updates.name;
     if (updates.priority !== undefined) apiParams.priority = updates.priority;
+    // FIX 2026-08-02: update_issue exposed no description field, so an agent could
+    // not write findings back onto an issue and had to keep the record elsewhere.
+    if (updates.description !== undefined) {
+      apiParams.description_html = updates.description ? `<p>${updates.description}</p>` : '';
+    }
     if (stateId !== undefined) apiParams.state = stateId;
     if (assigneeIds !== undefined) apiParams.assignees = assigneeIds;
     if (updates.target_date !== undefined) apiParams.target_date = updates.target_date || null;
     if (updates.start_date !== undefined) apiParams.start_date = updates.start_date || null;
 
     await apiUpdateWorkItem(projectId, issueId, apiParams, instance);
-    return `Updated ${projectIdentifier}-${seqId}`;
+    const drift = await verifyIssueWrite(issueId, updates, instance);
+    if (drift.length > 0)
+      return `⚠ ${projectIdentifier}-${seqId} UPDATE DID NOT APPLY CLEANLY — verified by reading the row back: ${drift.join('; ')}. Re-check before relying on this.`;
+    return `Updated ${projectIdentifier}-${seqId} (verified)`;
   }
 
   // --- SQL fallback ---
@@ -526,6 +598,23 @@ export async function updateIssue(
   if (updates.start_date !== undefined) {
     setClauses.push(`start_date = $${paramIdx}`);
     params.push(updates.start_date || null);
+    paramIdx++;
+  }
+
+  if (updates.description !== undefined) {
+    const dTxt = updates.description || '';
+    const dHtml = dTxt ? `<p>${dTxt}</p>` : '';
+    const dJson = dTxt
+      ? JSON.stringify({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: dTxt }] }] })
+      : '{}';
+    setClauses.push(`description = $${paramIdx}::jsonb`);
+    params.push(dJson);
+    paramIdx++;
+    setClauses.push(`description_html = $${paramIdx}`);
+    params.push(dHtml);
+    paramIdx++;
+    setClauses.push(`description_stripped = $${paramIdx}`);
+    params.push(dTxt);
     paramIdx++;
   }
 
@@ -575,7 +664,12 @@ export async function updateIssue(
     }
   }
 
-  return result;
+  // Same read-back as the API path. `result` is a raw pg command tag ("UPDATE 1")
+  // and says nothing about whether the row now holds what was asked for.
+  const drift = await verifyIssueWrite(issueId, updates, instance);
+  if (drift.length > 0)
+    return `⚠ ${projectIdentifier}-${seqId} UPDATE DID NOT APPLY CLEANLY — verified by reading the row back: ${drift.join('; ')}. Re-check before relying on this. (${result})`;
+  return `Updated ${projectIdentifier}-${seqId} (verified)`;
 }
 
 export async function completeIssue(issueIds: string[], instance: InstanceName = 'personal'): Promise<string> {

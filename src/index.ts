@@ -133,7 +133,7 @@ server.tool(
     description: z.string().optional().describe('Issue description (plain text)'),
     target_date: z.string().optional().describe('Due date (YYYY-MM-DD)'),
     start_date: z.string().optional().describe('Start date (YYYY-MM-DD)'),
-    labels: z.array(z.string()).optional().describe('Label names to attach'),
+    labels: z.array(z.string()).optional().describe('Label names to attach. MUST already exist — an unknown label FAILS the call rather than being silently dropped.'),
     instance: instanceParam,
   },
   async ({ instance, ...opts }) => {
@@ -148,7 +148,7 @@ server.tool(
 
 server.tool(
   'update_issue',
-  'Update an existing issue. Only provided fields are changed.',
+  'Update an existing issue. Only provided fields are changed. The row is READ BACK after the write and any drift is reported — a success line means the change was verified, not merely requested.',
   {
     issue_id: z.string().describe('Issue UUID'),
     name: z.string().optional().describe('New title'),
@@ -157,6 +157,7 @@ server.tool(
     assignee: z.string().optional().describe('New assignee name or email (empty string to unassign)'),
     target_date: z.string().optional().describe('New due date (YYYY-MM-DD, empty string to clear)'),
     start_date: z.string().optional().describe('New start date (YYYY-MM-DD, empty string to clear)'),
+    description: z.string().optional().describe('New description (plain text; empty string clears it)'),
     instance: instanceParam,
   },
   async ({ issue_id, instance, ...updates }) => {
