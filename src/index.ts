@@ -154,10 +154,11 @@ server.tool(
     name: z.string().optional().describe('New title'),
     priority: z.string().optional().describe('New priority: urgent, high, medium, low, none'),
     state: z.string().optional().describe('New state name or group'),
-    assignee: z.string().optional().describe('New assignee name or email (empty string to unassign)'),
+    assignee: z.string().optional().describe('New assignee name or email — REPLACES the current assignee (empty string unassigns). An unmatched name fails the call.'),
     target_date: z.string().optional().describe('New due date (YYYY-MM-DD, empty string to clear)'),
     start_date: z.string().optional().describe('New start date (YYYY-MM-DD, empty string to clear)'),
     description: z.string().optional().describe('New description (plain text; empty string clears it)'),
+    labels: z.array(z.string()).optional().describe('Label names — REPLACES all labels on the issue. Must already exist; an unknown label fails the call. Pass [] to clear.'),
     instance: instanceParam,
   },
   async ({ issue_id, instance, ...updates }) => {

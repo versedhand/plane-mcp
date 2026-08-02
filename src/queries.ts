@@ -487,6 +487,7 @@ export async function updateIssue(
     target_date?: string;
     start_date?: string;
     description?: string;
+    labels?: string[];
   },
   instance: InstanceName = 'personal',
 ): Promise<string> {
@@ -524,6 +525,36 @@ export async function updateIssue(
     }
   }
 
+  // Resolve label names to UUIDs. Same rule as createIssue: an unknown label FAILS
+  // rather than being silently dropped. Added 2026-08-02 — update_issue had no labels
+  // param at all, so a label could never be attached to an EXISTING issue and the 31
+  // unlabelled research tasks had no MCP repair path.
+  let labelIds: string[] | undefined;
+  if (updates.labels !== undefined) {
+    labelIds = [];
+    const missing: string[] = [];
+    for (const labelName of updates.labels) {
+      const rows = await query(
+        `SELECT id FROM labels WHERE workspace_id = $1 AND name ILIKE $2 AND deleted_at IS NULL LIMIT 1`,
+        [issueRows[0].workspace_id, labelName],
+        instance,
+      );
+      if (rows.length > 0) labelIds.push(rows[0].id);
+      else missing.push(labelName);
+    }
+    if (missing.length > 0) {
+      const known = await query(
+        `SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY name`,
+        [issueRows[0].workspace_id],
+        instance,
+      );
+      throw new Error(
+        `Label(s) not found: ${missing.join(', ')}. Nothing was changed. ` +
+          `Existing labels: ${known.map((r: any) => r.name).join(', ') || '(none)'}`,
+      );
+    }
+  }
+
   // Resolve assignee name/email to UUID if provided
   let assigneeIds: string[] | undefined;
   if (updates.assignee !== undefined) {
@@ -536,15 +567,16 @@ export async function updateIssue(
         instance,
       );
       if (users.length > 0) {
-        // Preserve existing assignees and add the new one
-        const existing = await query(
-          `SELECT assignee_id FROM issue_assignees WHERE issue_id = $1 AND deleted_at IS NULL`,
-          [issueId],
-          instance,
+        // FIX 2026-08-02: this used to PRESERVE existing assignees and append, so the
+        // API path could never reassign — only accumulate. The SQL path already
+        // replaced (delete-then-insert), so the two paths disagreed about what
+        // `assignee` means. REPLACE is the correct semantic and now both agree.
+        assigneeIds = [users[0].id];
+      } else {
+        throw new Error(
+          `Assignee '${updates.assignee}' not found — nothing was changed. ` +
+            `Use a name or email fragment that matches a workspace member.`,
         );
-        const existingIds = existing.map((r: any) => r.assignee_id as string);
-        const newId = users[0].id;
-        assigneeIds = existingIds.includes(newId) ? existingIds : [...existingIds, newId];
       }
     }
   }
@@ -561,6 +593,7 @@ export async function updateIssue(
     }
     if (stateId !== undefined) apiParams.state = stateId;
     if (assigneeIds !== undefined) apiParams.assignees = assigneeIds;
+    if (labelIds !== undefined) apiParams.labels = labelIds;
     if (updates.target_date !== undefined) apiParams.target_date = updates.target_date || null;
     if (updates.start_date !== undefined) apiParams.start_date = updates.start_date || null;
 
@@ -661,6 +694,22 @@ export async function updateIssue(
           instance,
         );
       }
+    }
+  }
+
+  if (labelIds !== undefined) {
+    await execute(
+      `UPDATE issue_labels SET deleted_at = $2 WHERE issue_id = $1 AND deleted_at IS NULL`,
+      [issueId, now],
+      instance,
+    );
+    for (const lid of labelIds) {
+      await execute(
+        `INSERT INTO issue_labels (id, issue_id, label_id, project_id, workspace_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)`,
+        [randomUUID(), issueId, lid, projectId, issueRows[0].workspace_id, now],
+        instance,
+      );
     }
   }
 
