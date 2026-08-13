@@ -15,18 +15,50 @@ import { listProjects, listIssues, getIssue, searchIssues, rawQuery, tasksDue, c
 import { shutdown, getPool, getLifedbPool } from './db.js';
 import type { InstanceName } from './db.js';
 
+// ⭐ CREDENTIAL GATE (added 2026-08-13). These are INTEGRATION tests: they open live
+// connections to both Plane instances and CREATE REAL ISSUES ("Test issue — delete me").
+// Without credentials every one of them threw `Plane instance 'personal' not configured`, so
+// `npm test` reported 11 failed / 4 passed and had NEVER been green on a normal dev box.
+//
+// ⛔ WHY THAT MATTERED: a suite with permanent red cannot gate a change — nobody can tell a new
+// regression from the standing failures, so everyone stops reading it. This package is published
+// at 1.3.0 and is the live task interface for both Plane instances, and it has ALREADY shipped
+// two silent-failure defects (an unknown label accepted and silently dropped; an empty
+// target_date flipping an issue to Done). Those are exactly what a working suite catches.
+//
+// Skipping-with-a-reason is not hiding them: a skip is visibly distinct from a pass, whereas a
+// permanent failure is visibly identical to a new one.
+//
+// To RUN them, supply the env in the header comment above and use:  npm run test:integration
+const HAS_PLANE_CREDS =
+  Boolean(process.env.PLANE_PERSONAL_DB_HOST || process.env.PLANE_DB_HOST) &&
+  Boolean(process.env.PLANE_NTS_DB_HOST);
+
+const describeLive = HAS_PLANE_CREDS ? describe : describe.skip;
+// Per-test gate, for describes that mix live and pure-logic cases. `rawQuery`s
+// DML-injection guard is pure logic on a PUBLISHED MCP and must never be skipped.
+const itLive = HAS_PLANE_CREDS ? it : it.skip;
+
+if (!HAS_PLANE_CREDS) {
+  // Say it out loud. A silent skip and a suite with no tests look the same in CI output.
+  console.warn(
+    '[plane-mcp] SKIPPING live Plane integration tests — PLANE_PERSONAL_DB_HOST / ' +
+    'PLANE_NTS_DB_HOST not set. These create real issues, so they are not run by default. ' +
+    'See the header comment for the env, then: npm run test:integration');
+}
+
 afterAll(async () => {
   await shutdown();
 });
 
 describe('multi-instance connectivity', () => {
-  it('connects to personal instance', async () => {
+  itLive('connects to personal instance', async () => {
     const pool = getPool('personal');
     const result = await pool.query('SELECT 1 as ok');
     expect(result.rows[0].ok).toBe(1);
   });
 
-  it('connects to nts instance', async () => {
+  itLive('connects to nts instance', async () => {
     const pool = getPool('nts');
     const result = await pool.query('SELECT 1 as ok');
     expect(result.rows[0].ok).toBe(1);
@@ -39,7 +71,7 @@ describe('multi-instance connectivity', () => {
   });
 });
 
-describe('listProjects', () => {
+describeLive('listProjects', () => {
   it('lists personal projects', async () => {
     const result = await listProjects('personal');
     expect(result).toContain('HLT');
@@ -54,7 +86,7 @@ describe('listProjects', () => {
   });
 });
 
-describe('listIssues', () => {
+describeLive('listIssues', () => {
   it('lists issues with project filter', async () => {
     const result = await listIssues({ project: 'HLT', instance: 'personal' });
     expect(result).toContain('HLT-');
@@ -71,7 +103,7 @@ describe('listIssues', () => {
   });
 });
 
-describe('searchIssues', () => {
+describeLive('searchIssues', () => {
   it('searches personal issues', async () => {
     const result = await searchIssues('exercise', 5, 'personal');
     expect(result.toLowerCase()).toContain('exercise');
@@ -79,7 +111,8 @@ describe('searchIssues', () => {
 });
 
 describe('rawQuery', () => {
-  it('runs SELECT on personal instance', async () => {
+  // needs a live Plane connection; the DML guard below does NOT and must keep running
+  itLive('runs SELECT on personal instance', async () => {
     const result = await rawQuery('SELECT COUNT(*) as cnt FROM projects WHERE deleted_at IS NULL', 'personal');
     expect(result).toContain('cnt');
   });
@@ -116,7 +149,7 @@ describe('tasksDue', () => {
 // tasks/tasks_system_overview.md. If recurrence ever returns to Plane, write new
 // tests against whatever it actually uses; do not restore these.
 
-describe('createIssue', () => {
+describeLive('createIssue', () => {
   let testIssueId: string | null = null;
 
   it('creates issue by project identifier', async () => {
