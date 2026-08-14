@@ -35,12 +35,56 @@ export async function listProjects(instance: InstanceName = 'personal'): Promise
     instance,
   );
 
-  if (rows.length === 0) return `No projects found on ${instance} instance.`;
+  // ⭐ DECLARE THE PARTIAL VIEW (added 2026-08-13). The SELECT above is scoped to one
+  // workspace and drops archived projects — both deliberate, and both previously
+  // INVISIBLE to the caller. On the `nts` instance that returned 4 rows out of 7
+  // non-archived, non-deleted projects: CHARI, RACQU and VERSE sit in the `charisse`,
+  // `racquelri` and `versedhand` workspaces of the SAME database. No error, no hint —
+  // a short list and a complete list were the same shape, which is how a caller
+  // concludes a project does not exist. (`personal` hides NSH, archived 2026-05-25.)
+  //
+  // ⛔ THE FIX IS THE DISCLOSURE, NOT A WIDER QUERY. This tool is workspace-scoped on
+  // purpose and its own description says "in the workspace"; returning every
+  // workspace's projects would change what the tool means. What was defective was the
+  // silence about the boundary.
+  //
+  // Counted in the same round trip as a separate cheap query rather than by relaxing
+  // the filters above, so the returned ROWS are byte-for-byte what they always were
+  // and only the footer is new.
+  const excludedRows = await query(
+    `SELECT
+       count(*) FILTER (WHERE p.workspace_id = $1 AND p.archived_at IS NOT NULL) AS archived,
+       count(*) FILTER (WHERE p.workspace_id <> $1) AS other_ws,
+       coalesce(
+         (SELECT string_agg(DISTINCT w.slug, ', ' ORDER BY w.slug)
+          FROM projects p2 JOIN workspaces w ON p2.workspace_id = w.id
+          WHERE p2.workspace_id <> $1 AND p2.deleted_at IS NULL), '') AS other_ws_slugs
+     FROM projects p
+     WHERE p.deleted_at IS NULL`,
+    [wsId],
+    instance,
+  );
+  const ex: any = excludedRows[0] ?? {};
+  const nArchived = Number(ex.archived ?? 0);
+  const nOtherWs = Number(ex.other_ws ?? 0);
+  const parts: string[] = [];
+  if (nArchived > 0) parts.push(`${nArchived} archived`);
+  if (nOtherWs > 0) {
+    parts.push(
+      `${nOtherWs} in other workspace${nOtherWs === 1 ? '' : 's'} on this instance (${ex.other_ws_slugs})`,
+    );
+  }
+  const footer = parts.length
+    ? `\n\n(Scoped to workspace '${getWorkspaceSlug(instance)}'. Excluded: ${parts.join('; ')}. ` +
+      `Use mcp__plane__query to reach them.)`
+    : '';
+
+  if (rows.length === 0) return `No projects found on ${instance} instance.${footer}`;
 
   const lines = rows.map(
     (r: any) => `${r.identifier} | ${r.name} | ${r.open_count}/${r.issue_count} open | id: ${r.id}`,
   );
-  return `[${instance}]\n` + lines.join('\n');
+  return `[${instance}]\n` + lines.join('\n') + footer;
 }
 
 export async function listIssues(opts: {

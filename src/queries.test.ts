@@ -84,6 +84,37 @@ describeLive('listProjects', () => {
     expect(result).toContain('NTS');
     expect(result).toContain('[nts]');
   });
+
+  // ⭐ THE PARTIAL VIEW MUST DECLARE ITSELF (added 2026-08-13).
+  // listProjects is scoped to ONE workspace per instance and filters archived
+  // projects. On the `nts` instance that is 4 rows out of 7 non-archived, non-deleted
+  // projects — CHARI, RACQU and VERSE live in the `charisse`, `racquelri` and
+  // `versedhand` workspaces on the SAME database and were structurally invisible with
+  // no error and no hint. A list that is short and a list that is complete looked
+  // identical, which is exactly how a caller concludes a project "does not exist".
+  //
+  // ⚠️ THIS ASSERTS THE DISCLOSURE, NOT THE ROWS. Widening the query to every
+  // workspace would be the wrong fix — the tool is deliberately workspace-scoped and
+  // its own description says "in the workspace". What was broken was the SILENCE.
+  //
+  // Red on the pre-fix code: it emitted only `[nts]` + 4 rows and nothing else.
+  it('discloses what it excluded on nts (archived + other workspaces)', async () => {
+    const result = await listProjects('nts');
+    expect(result).toMatch(/Excluded:/);
+    // The archived project (EMP) and the three other-workspace projects must both be
+    // accounted for by name of cause, and the other workspaces named so the reader can
+    // reach them with mcp__plane__query.
+    expect(result).toMatch(/archived/);
+    expect(result).toMatch(/other workspace/);
+    expect(result).toContain('versedhand');
+  });
+
+  // personal has an archived project (NSH, archived 2026-05-25) and exactly one
+  // workspace, so it exercises the archived half of the footer on its own.
+  it('discloses archived projects on personal', async () => {
+    const result = await listProjects('personal');
+    expect(result).toMatch(/Excluded:.*archived/);
+  });
 });
 
 describeLive('listIssues', () => {
