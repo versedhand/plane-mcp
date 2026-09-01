@@ -292,7 +292,16 @@ export async function createIssue(opts: {
   let assigneeId: string | null = null;
   if (opts.assignee) {
     const users = await query(
-      `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
+      // ⛔ is_active AND a deterministic ORDER BY are BOTH load-bearing (fixed 2026-09-01).
+      // Before this the query was `... ILIKE $1 OR email ILIKE $1 LIMIT 1` with NO active filter and
+      // NO ordering, so "Isaac" matched both isaac@rirobinson.com AND the disabled duplicate
+      // isaac@versedhand.com, and Postgres returned whichever row it reached first. Result: 48 of his
+      // open tasks were assigned to a DISABLED account he cannot see or log into — 23 of them created
+      // AFTER a ticket was filed about the problem, because the ticket could not fix a resolver bug.
+      // Same shape for racquel (10 tasks). An unmatched name already throws, which is correct; the
+      // defect was matching the WRONG one silently.
+      `SELECT id FROM users WHERE (first_name ILIKE $1 OR email ILIKE $1) AND is_active = true
+         ORDER BY (email ILIKE $1) DESC, email LIMIT 1`,
       [`%${opts.assignee}%`],
       inst,
     );
@@ -606,7 +615,16 @@ export async function updateIssue(
       assigneeIds = []; // unassign
     } else {
       const users = await query(
-        `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
+        // ⛔ is_active AND a deterministic ORDER BY are BOTH load-bearing (fixed 2026-09-01).
+      // Before this the query was `... ILIKE $1 OR email ILIKE $1 LIMIT 1` with NO active filter and
+      // NO ordering, so "Isaac" matched both isaac@rirobinson.com AND the disabled duplicate
+      // isaac@versedhand.com, and Postgres returned whichever row it reached first. Result: 48 of his
+      // open tasks were assigned to a DISABLED account he cannot see or log into — 23 of them created
+      // AFTER a ticket was filed about the problem, because the ticket could not fix a resolver bug.
+      // Same shape for racquel (10 tasks). An unmatched name already throws, which is correct; the
+      // defect was matching the WRONG one silently.
+      `SELECT id FROM users WHERE (first_name ILIKE $1 OR email ILIKE $1) AND is_active = true
+         ORDER BY (email ILIKE $1) DESC, email LIMIT 1`,
         [`%${updates.assignee}%`],
         instance,
       );
@@ -726,7 +744,16 @@ export async function updateIssue(
 
     if (updates.assignee) {
       const users = await query(
-        `SELECT id FROM users WHERE first_name ILIKE $1 OR email ILIKE $1 LIMIT 1`,
+        // ⛔ is_active AND a deterministic ORDER BY are BOTH load-bearing (fixed 2026-09-01).
+      // Before this the query was `... ILIKE $1 OR email ILIKE $1 LIMIT 1` with NO active filter and
+      // NO ordering, so "Isaac" matched both isaac@rirobinson.com AND the disabled duplicate
+      // isaac@versedhand.com, and Postgres returned whichever row it reached first. Result: 48 of his
+      // open tasks were assigned to a DISABLED account he cannot see or log into — 23 of them created
+      // AFTER a ticket was filed about the problem, because the ticket could not fix a resolver bug.
+      // Same shape for racquel (10 tasks). An unmatched name already throws, which is correct; the
+      // defect was matching the WRONG one silently.
+      `SELECT id FROM users WHERE (first_name ILIKE $1 OR email ILIKE $1) AND is_active = true
+         ORDER BY (email ILIKE $1) DESC, email LIMIT 1`,
         [`%${updates.assignee}%`],
         instance,
       );
