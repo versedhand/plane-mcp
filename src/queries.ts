@@ -1031,9 +1031,9 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
          WHERE i.workspace_id = $1
            AND i.deleted_at IS NULL AND i.archived_at IS NULL
            AND s.group NOT IN ('completed', 'cancelled')
-           AND i.target_date <= CURRENT_DATE
+           AND (i.target_date <= CURRENT_DATE OR i.target_date IS NULL)
          ORDER BY
-           i.target_date,
+           i.target_date NULLS LAST,
            CASE i.priority
              WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
              WHEN 'low' THEN 3 ELSE 4
@@ -1044,8 +1044,14 @@ export async function tasksDue(instance?: InstanceName | 'all'): Promise<string>
 
       for (const r of rows) {
         const priority = r.priority === 'none' ? '' : `[${r.priority.toUpperCase()}] `;
-        const overdue = r.target_date < new Date().toISOString().split('T')[0] ? ' OVERDUE' : '';
-        allLines.push(`${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | ${r.assignees} | Due: ${r.target_date}${overdue} | ${r.state_name} [${inst}]`);
+        // UNDATED items are included deliberately (Isaac ruled 2026-09-01: "due should include
+        // undated in case we miss them"). Before this, an item with no target_date could NEVER
+        // appear here -- and since every daily surfacing runs through tasksDue, 178 of his 220
+        // open items were structurally unreachable. Measured the day of the ruling.
+        const undated = r.target_date == null;
+        const overdue = !undated && r.target_date < new Date().toISOString().split('T')[0] ? ' OVERDUE' : '';
+        const dueField = undated ? 'NO DUE DATE' : `Due: ${r.target_date}${overdue}`;
+        allLines.push(`${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | ${r.assignees} | ${dueField} | ${r.state_name} [${inst}]`);
       }
     } catch (err: any) {
       allLines.push(`[ERROR ${inst}]: ${err.message}`);
