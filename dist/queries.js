@@ -1,0 +1,857 @@
+import { query, execute, getWorkspaceSlug, getAvailableInstances, getLifedbPool } from './db.js';
+import { hasApiConfig, apiCreateWorkItem, apiUpdateWorkItem } from './api.js';
+import { randomUUID } from 'crypto';
+// Cache workspace IDs per instance
+const workspaceIds = new Map();
+async function getWorkspaceId(instance = 'personal') {
+    if (workspaceIds.has(instance))
+        return workspaceIds.get(instance);
+    const slug = getWorkspaceSlug(instance);
+    const rows = await query(`SELECT id FROM workspaces WHERE slug = $1 AND deleted_at IS NULL`, [slug], instance);
+    if (rows.length === 0)
+        throw new Error(`Workspace '${slug}' not found on ${instance} instance`);
+    workspaceIds.set(instance, rows[0].id);
+    return workspaceIds.get(instance);
+}
+export async function listProjects(instance = 'personal') {
+    const wsId = await getWorkspaceId(instance);
+    const rows = await query(`SELECT p.id, p.name, p.identifier,
+       (SELECT count(*) FROM issues i WHERE i.project_id = p.id AND i.deleted_at IS NULL) as issue_count,
+       (SELECT count(*) FROM issues i
+        JOIN states s ON i.state_id = s.id
+        WHERE i.project_id = p.id AND i.deleted_at IS NULL
+        AND s.group NOT IN ('completed', 'cancelled')) as open_count
+     FROM projects p
+     WHERE p.workspace_id = $1 AND p.deleted_at IS NULL AND p.archived_at IS NULL
+     ORDER BY p.name`, [wsId], instance);
+    // ⭐ DECLARE THE PARTIAL VIEW (added 2026-08-13). The SELECT above is scoped to one
+    // workspace and drops archived projects — both deliberate, and both previously
+    // INVISIBLE to the caller. On the `nts` instance that returned 4 rows out of 7
+    // non-archived, non-deleted projects: CHARI, RACQU and VERSE sit in the `charisse`,
+    // `racquelri` and `versedhand` workspaces of the SAME database. No error, no hint —
+    // a short list and a complete list were the same shape, which is how a caller
+    // concludes a project does not exist. (`personal` hides NSH, archived 2026-05-25.)
+    //
+    // ⛔ THE FIX IS THE DISCLOSURE, NOT A WIDER QUERY. This tool is workspace-scoped on
+    // purpose and its own description says "in the workspace"; returning every
+    // workspace's projects would change what the tool means. What was defective was the
+    // silence about the boundary.
+    //
+    // Counted in the same round trip as a separate cheap query rather than by relaxing
+    // the filters above, so the returned ROWS are byte-for-byte what they always were
+    // and only the footer is new.
+    const excludedRows = await query(`SELECT
+       count(*) FILTER (WHERE p.workspace_id = $1 AND p.archived_at IS NOT NULL) AS archived,
+       count(*) FILTER (WHERE p.workspace_id <> $1) AS other_ws,
+       coalesce(
+         (SELECT string_agg(DISTINCT w.slug, ', ' ORDER BY w.slug)
+          FROM projects p2 JOIN workspaces w ON p2.workspace_id = w.id
+          WHERE p2.workspace_id <> $1 AND p2.deleted_at IS NULL), '') AS other_ws_slugs
+     FROM projects p
+     WHERE p.deleted_at IS NULL`, [wsId], instance);
+    const ex = excludedRows[0] ?? {};
+    const nArchived = Number(ex.archived ?? 0);
+    const nOtherWs = Number(ex.other_ws ?? 0);
+    const parts = [];
+    if (nArchived > 0)
+        parts.push(`${nArchived} archived`);
+    if (nOtherWs > 0) {
+        parts.push(`${nOtherWs} in other workspace${nOtherWs === 1 ? '' : 's'} on this instance (${ex.other_ws_slugs})`);
+    }
+    const footer = parts.length
+        ? `\n\n(Scoped to workspace '${getWorkspaceSlug(instance)}'. Excluded: ${parts.join('; ')}. ` +
+            `Use mcp__plane__query to reach them.)`
+        : '';
+    if (rows.length === 0)
+        return `No projects found on ${instance} instance.${footer}`;
+    const lines = rows.map((r) => `${r.identifier} | ${r.name} | ${r.open_count}/${r.issue_count} open | id: ${r.id}`);
+    return `[${instance}]\n` + lines.join('\n') + footer;
+}
+export async function listIssues(opts) {
+    const inst = opts.instance || 'personal';
+    const wsId = await getWorkspaceId(inst);
+    const conditions = [`i.workspace_id = $1`, `i.deleted_at IS NULL`, `i.archived_at IS NULL`];
+    const params = [wsId];
+    let paramIdx = 2;
+    if (opts.project) {
+        conditions.push(`(p.identifier = $${paramIdx} OR p.name ILIKE $${paramIdx})`);
+        params.push(opts.project);
+        paramIdx++;
+    }
+    if (opts.state) {
+        conditions.push(`(s.group = $${paramIdx} OR s.name ILIKE $${paramIdx})`);
+        params.push(opts.state);
+        paramIdx++;
+    }
+    if (opts.priority) {
+        conditions.push(`i.priority = $${paramIdx}`);
+        params.push(opts.priority);
+        paramIdx++;
+    }
+    if (opts.assignee) {
+        conditions.push(`EXISTS (
+      SELECT 1 FROM issue_assignees ia
+      JOIN users u ON ia.assignee_id = u.id
+      WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL
+      AND (u.first_name ILIKE $${paramIdx} OR u.email ILIKE $${paramIdx})
+    )`);
+        params.push(`%${opts.assignee}%`);
+        paramIdx++;
+    }
+    if (opts.label) {
+        conditions.push(`EXISTS (
+      SELECT 1 FROM issue_labels il
+      JOIN labels l ON il.label_id = l.id
+      WHERE il.issue_id = i.id AND il.deleted_at IS NULL
+      AND l.name ILIKE $${paramIdx}
+    )`);
+        params.push(`%${opts.label}%`);
+        paramIdx++;
+    }
+    const limit = opts.limit || 50;
+    const sql = `
+    SELECT i.id, i.name, i.priority, i.sequence_id,
+           i.start_date, i.target_date, i.completed_at,
+           s.name as state_name, s.group as state_group,
+           p.name as project_name, p.identifier as project_identifier,
+           COALESCE(
+             (SELECT string_agg(u.first_name, ', ')
+              FROM issue_assignees ia JOIN users u ON ia.assignee_id = u.id
+              WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL),
+             'unassigned'
+           ) as assignees,
+           COALESCE(
+             (SELECT string_agg(l.name, ', ')
+              FROM issue_labels il JOIN labels l ON il.label_id = l.id
+              WHERE il.issue_id = i.id AND il.deleted_at IS NULL),
+             ''
+           ) as labels
+    FROM issues i
+    JOIN states s ON i.state_id = s.id
+    JOIN projects p ON i.project_id = p.id
+    WHERE ${conditions.join(' AND ')}
+    ORDER BY
+      CASE i.priority
+        WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+        WHEN 'low' THEN 3 ELSE 4
+      END,
+      i.sort_order
+    LIMIT ${limit}
+  `;
+    const rows = await query(sql, params, inst);
+    if (rows.length === 0)
+        return 'No issues found.';
+    const lines = rows.map((r) => {
+        const priority = r.priority === 'none' ? '' : `[${r.priority.toUpperCase()}] `;
+        const due = r.target_date ? ` | Due: ${r.target_date}` : '';
+        const lbls = r.labels ? ` | ${r.labels}` : '';
+        return `${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | ${r.assignees}${due} | ${r.state_name}${lbls}`;
+    });
+    return lines.join('\n');
+}
+export async function getIssue(issueId, instance = 'personal') {
+    const rows = await query(`SELECT i.*,
+            s.name as state_name, s.group as state_group,
+            p.name as project_name, p.identifier as project_identifier,
+            COALESCE(
+              (SELECT string_agg(u.first_name || ' (' || u.email || ')', ', ')
+               FROM issue_assignees ia JOIN users u ON ia.assignee_id = u.id
+               WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL),
+              'unassigned'
+            ) as assignees,
+            COALESCE(
+              (SELECT string_agg(l.name, ', ')
+               FROM issue_labels il JOIN labels l ON il.label_id = l.id
+               WHERE il.issue_id = i.id AND il.deleted_at IS NULL),
+              ''
+            ) as labels
+     FROM issues i
+     JOIN states s ON i.state_id = s.id
+     JOIN projects p ON i.project_id = p.id
+     WHERE i.id = $1 AND i.deleted_at IS NULL`, [issueId], instance);
+    if (rows.length === 0)
+        return 'Issue not found.';
+    const r = rows[0];
+    const lines = [
+        `# ${r.project_identifier}-${r.sequence_id}: ${r.name}`,
+        `Priority: ${r.priority} | State: ${r.state_name} (${r.state_group})`,
+        `Assignees: ${r.assignees}`,
+        `Project: ${r.project_name}`,
+    ];
+    if (r.labels)
+        lines.push(`Labels: ${r.labels}`);
+    if (r.start_date)
+        lines.push(`Start: ${r.start_date}`);
+    if (r.target_date)
+        lines.push(`Due: ${r.target_date}`);
+    if (r.completed_at)
+        lines.push(`Completed: ${r.completed_at}`);
+    if (r.description_stripped)
+        lines.push(`\nDescription:\n${r.description_stripped}`);
+    return lines.join('\n');
+}
+export async function createIssue(opts) {
+    const inst = opts.instance || 'personal';
+    const wsId = await getWorkspaceId(inst);
+    // Resolve project (supports UUID, identifier, or name)
+    const projects = await query(`SELECT id, identifier FROM projects
+     WHERE workspace_id = $1 AND deleted_at IS NULL
+     AND (id::text = $2 OR identifier = $2 OR name ILIKE $2)`, [wsId, opts.project], inst);
+    if (projects.length === 0)
+        throw new Error(`Project '${opts.project}' not found`);
+    const projectId = projects[0].id;
+    const projectIdentifier = projects[0].identifier;
+    // Resolve state (needed for both API and SQL paths)
+    let stateId;
+    if (opts.state) {
+        const states = await query(`SELECT id FROM states WHERE project_id = $1 AND deleted_at IS NULL
+       AND (name ILIKE $2 OR "group" = $2) ORDER BY sequence LIMIT 1`, [projectId, opts.state], inst);
+        if (states.length === 0)
+            throw new Error(`State '${opts.state}' not found`);
+        stateId = states[0].id;
+    }
+    else {
+        const states = await query(`SELECT id FROM states WHERE project_id = $1 AND deleted_at IS NULL
+       AND "group" = 'unstarted' ORDER BY sequence LIMIT 1`, [projectId], inst);
+        if (states.length === 0) {
+            const fallback = await query(`SELECT id FROM states WHERE project_id = $1 AND deleted_at IS NULL
+         ORDER BY sequence LIMIT 1`, [projectId], inst);
+            if (fallback.length === 0)
+                throw new Error('No states found for project');
+            stateId = fallback[0].id;
+        }
+        else {
+            stateId = states[0].id;
+        }
+    }
+    // Resolve assignee to user UUID (needed for both paths)
+    let assigneeId = null;
+    if (opts.assignee) {
+        const users = await query(
+        // ⛔ is_active AND a deterministic ORDER BY are BOTH load-bearing (fixed 2026-09-01).
+        // Before this the query was `... ILIKE $1 OR email ILIKE $1 LIMIT 1` with NO active filter and
+        // NO ordering, so "Isaac" matched both isaac@rirobinson.com AND the disabled duplicate
+        // isaac@versedhand.com, and Postgres returned whichever row it reached first. Result: 48 of his
+        // open tasks were assigned to a DISABLED account he cannot see or log into — 23 of them created
+        // AFTER a ticket was filed about the problem, because the ticket could not fix a resolver bug.
+        // Same shape for racquel (10 tasks). An unmatched name already throws, which is correct; the
+        // defect was matching the WRONG one silently.
+        `SELECT id FROM users WHERE (first_name ILIKE $1 OR email ILIKE $1) AND is_active = true
+         ORDER BY (email ILIKE $1) DESC, email LIMIT 1`, [`%${opts.assignee}%`], inst);
+        if (users.length > 0)
+            assigneeId = users[0].id;
+    }
+    // Resolve label names to UUIDs (needed for both paths)
+    // FIX 2026-08-02: an unknown label used to be SILENTLY DROPPED while the call
+    // reported success. Measured cost: the corpus mandates a `research-review` label
+    // on every research task; the label was not created until 2026-07-31, so 31 of 33
+    // review tasks carry no label. `list_issues(label="research-review")` returned 2
+    // and read as "backlog nearly clear" while the real backlog was 33. Nobody skipped
+    // the gate — the gate's own instrument could not see its own queue.
+    // An unknown label and an attached label must NEVER produce the same output.
+    const labelIds = [];
+    const missingLabels = [];
+    if (opts.labels && opts.labels.length > 0) {
+        for (const labelName of opts.labels) {
+            const lblRows = await query(`SELECT id FROM labels WHERE workspace_id = $1 AND name ILIKE $2 AND deleted_at IS NULL LIMIT 1`, [wsId, labelName], inst);
+            if (lblRows.length > 0)
+                labelIds.push(lblRows[0].id);
+            else
+                missingLabels.push(labelName);
+        }
+        if (missingLabels.length > 0) {
+            const known = await query(`SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY name`, [wsId], inst);
+            throw new Error(`Label(s) not found: ${missingLabels.join(', ')}. ` +
+                `Nothing was created — fix the label name or create the label first, then retry. ` +
+                `Existing labels in this workspace: ${known.map((r) => r.name).join(', ') || '(none)'}`);
+        }
+    }
+    const descText = opts.description || '';
+    const descHtml = descText ? `<p>${descText}</p>` : '';
+    // --- REST API path (preferred: triggers notifications) ---
+    if (hasApiConfig(inst)) {
+        const result = await apiCreateWorkItem(projectId, {
+            name: opts.name,
+            priority: opts.priority || 'none',
+            state: stateId,
+            assignees: assigneeId ? [assigneeId] : undefined,
+            labels: labelIds.length > 0 ? labelIds : undefined,
+            description_html: descHtml || undefined,
+            start_date: opts.start_date || null,
+            target_date: opts.target_date || null,
+        }, inst);
+        return `Created ${projectIdentifier}-${result.sequence_id}: ${opts.name} (id: ${result.id})`;
+    }
+    // --- SQL fallback (no API configured) ---
+    await execute(`SELECT pg_advisory_lock(hashtext($1::text))`, [projectId], inst);
+    const seqRows = await query(`SELECT COALESCE(MAX(sequence_id), 0) + 1 as next_seq FROM issues WHERE project_id = $1`, [projectId], inst);
+    const nextSeq = seqRows[0].next_seq;
+    const issueId = randomUUID();
+    const now = new Date().toISOString();
+    const descJson = descText
+        ? JSON.stringify({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: descText }] }] })
+        : '{}';
+    await execute(`INSERT INTO issues (id, name, description, description_html, description_stripped, priority, state_id,
+       project_id, workspace_id, sequence_id, sort_order, is_draft, created_at, updated_at,
+       start_date, target_date)
+     VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7, $8, $9, $10, $11, false, $12, $12, $13, $14)`, [
+        issueId,
+        opts.name,
+        descJson,
+        descHtml,
+        descText,
+        opts.priority || 'none',
+        stateId,
+        projectId,
+        wsId,
+        nextSeq,
+        nextSeq * 65536,
+        now,
+        opts.start_date || null,
+        opts.target_date || null,
+    ], inst);
+    if (assigneeId) {
+        await execute(`INSERT INTO issue_assignees (id, issue_id, assignee_id, project_id, workspace_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $6)`, [randomUUID(), issueId, assigneeId, projectId, wsId, now], inst);
+    }
+    for (const labelId of labelIds) {
+        await execute(`INSERT INTO issue_labels (id, issue_id, label_id, project_id, workspace_id, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $6)`, [randomUUID(), issueId, labelId, projectId, wsId, now], inst);
+    }
+    await execute(`INSERT INTO issue_sequences (id, issue_id, project_id, workspace_id, sequence, deleted, created_at, updated_at)
+     VALUES ($1, $2, $3, $4, $5, false, $6, $6)`, [randomUUID(), issueId, projectId, wsId, nextSeq, now], inst);
+    await execute(`SELECT pg_advisory_unlock(hashtext($1::text))`, [projectId], inst);
+    // READ-BACK VERIFICATION (added 2026-07-31).
+    //
+    // WHY: this function used to return "Created X" the moment the inserts were
+    // issued — a success message written by the layer that REQUESTED the action,
+    // never by the layer that observed its effect. Concretely, label resolution
+    // above does `if (lblRows.length > 0) labelIds.push(...)`, so an unknown label
+    // name is SILENTLY DROPPED: the caller asks for a label, gets "Created X", and
+    // the issue has no label. That is exactly what happened to the mandated
+    // `research-review` label — every agent that "complied" produced an unlabelled
+    // task and reported success, for months.
+    //
+    // So: query the issue back and report what ACTUALLY attached. This catches
+    // unresolved names AND any future silent drop nobody anticipated, because it
+    // compares requested against observed rather than against expectations.
+    const notes = [];
+    try {
+        const gotLabels = await query(`SELECT l.name FROM issue_labels il JOIN labels l ON l.id = il.label_id
+       WHERE il.issue_id = $1`, [issueId], inst);
+        const gotNames = gotLabels.map((r) => r.name);
+        const wanted = opts.labels ?? [];
+        const missing = wanted.filter((w) => !gotNames.some((g) => g.toLowerCase() === w.toLowerCase()));
+        if (missing.length > 0) {
+            notes.push(`⚠️ LABEL(S) NOT ATTACHED: ${missing.join(', ')} — no such label in this workspace, so it was dropped. ` +
+                `Create the label in Plane first, or omit it. Attached: ${gotNames.length ? gotNames.join(', ') : 'none'}.`);
+        }
+        if (opts.assignee) {
+            const gotAssignees = await query(`SELECT u.email FROM issue_assignees ia JOIN users u ON u.id = ia.assignee_id
+         WHERE ia.issue_id = $1`, [issueId], inst);
+            if (gotAssignees.length === 0) {
+                notes.push(`⚠️ ASSIGNEE NOT SET: "${opts.assignee}" matched no user — the issue is UNASSIGNED. ` +
+                    `Unassigned tasks are invisible tasks.`);
+            }
+        }
+    }
+    catch (e) {
+        // Fail LOUD, never silent: an unverifiable create must not read like a clean one.
+        notes.push(`⚠️ READ-BACK FAILED (${e instanceof Error ? e.message : String(e)}) — attributes UNVERIFIED.`);
+    }
+    const base = `Created ${projectIdentifier}-${nextSeq}: ${opts.name} (id: ${issueId})`;
+    return notes.length > 0 ? `${base}\n${notes.join('\n')}` : base;
+}
+/**
+ * Read an issue back after a write and report any drift from what was asked for.
+ *
+ * FIX 2026-08-02. Both write paths used to report success unconditionally — the API
+ * path returned `Updated X-N`, the SQL path returned the raw pg tag `UPDATE 1`.
+ * Two silent failures were measured that day: clearing `target_date` ALSO flipped the
+ * issue to a completed state, and `complete_issue` succeeded while the issue was back
+ * at Todo 23 seconds later. In both cases the call's own output said success.
+ *
+ * A write that took and a write that did not must never produce the same output.
+ * This runs in BOTH paths deliberately: the first version of this fix was added only
+ * to the API path, and `hasApiConfig` is false here, so it guarded code that never ran.
+ */
+async function verifyIssueWrite(issueId, updates, instance) {
+    const after = await query(`SELECT i.name, i.target_date, i.start_date, i.priority, s.name AS state_name, s."group" AS state_group
+     FROM issues i LEFT JOIN states s ON i.state_id = s.id
+     WHERE i.id = $1 AND i.deleted_at IS NULL`, [issueId], instance);
+    const drift = [];
+    if (after.length === 0)
+        return ['issue not readable after the write'];
+    const row = after[0];
+    const wantDate = (v) => (v ? String(v).slice(0, 10) : null);
+    const gotDate = (v) => (v ? new Date(v).toISOString().slice(0, 10) : null);
+    if (updates.name !== undefined && row.name !== updates.name)
+        drift.push(`name is "${row.name}"`);
+    if (updates.priority !== undefined && row.priority !== updates.priority)
+        drift.push(`priority is "${row.priority}"`);
+    if (updates.target_date !== undefined && gotDate(row.target_date) !== wantDate(updates.target_date))
+        drift.push(`target_date is ${gotDate(row.target_date) ?? 'null'}`);
+    if (updates.start_date !== undefined && gotDate(row.start_date) !== wantDate(updates.start_date))
+        drift.push(`start_date is ${gotDate(row.start_date) ?? 'null'}`);
+    // The dangerous one: a completion nobody asked for.
+    if (updates.state === undefined && row.state_group === 'completed')
+        drift.push(`⚠ state is now "${row.state_name}" (completed) and that was not requested`);
+    return drift;
+}
+export async function updateIssue(issueId, updates, instance = 'personal') {
+    // Look up issue's project (needed for both paths)
+    const issueRows = await query(`SELECT i.project_id, i.workspace_id, p.identifier as project_identifier, i.sequence_id
+     FROM issues i JOIN projects p ON i.project_id = p.id
+     WHERE i.id = $1 AND i.deleted_at IS NULL`, [issueId], instance);
+    if (issueRows.length === 0)
+        return 'Issue not found.';
+    const { project_id: projectId, project_identifier: projectIdentifier, sequence_id: seqId } = issueRows[0];
+    // Resolve state name/group to UUID if provided
+    let stateId;
+    if (updates.state) {
+        const states = await query(`SELECT id, "group" FROM states WHERE project_id = $1 AND deleted_at IS NULL
+       AND (name ILIKE $2 OR "group" = $2) ORDER BY sequence LIMIT 1`, [projectId, updates.state], instance);
+        if (states.length > 0) {
+            stateId = states[0].id;
+        }
+        else {
+            // Fallback: project has no states — search workspace-wide for a matching state
+            const fallbackStates = await query(`SELECT id, "group" FROM states WHERE workspace_id = $1 AND deleted_at IS NULL
+         AND (name ILIKE $2 OR "group" = $2) ORDER BY sequence LIMIT 1`, [issueRows[0].workspace_id, updates.state], instance);
+            if (fallbackStates.length > 0)
+                stateId = fallbackStates[0].id;
+        }
+    }
+    // Resolve label names to UUIDs. Same rule as createIssue: an unknown label FAILS
+    // rather than being silently dropped. Added 2026-08-02 — update_issue had no labels
+    // param at all, so a label could never be attached to an EXISTING issue and the 31
+    // unlabelled research tasks had no MCP repair path.
+    let labelIds;
+    if (updates.labels !== undefined) {
+        labelIds = [];
+        const missing = [];
+        for (const labelName of updates.labels) {
+            const rows = await query(`SELECT id FROM labels WHERE workspace_id = $1 AND name ILIKE $2 AND deleted_at IS NULL LIMIT 1`, [issueRows[0].workspace_id, labelName], instance);
+            if (rows.length > 0)
+                labelIds.push(rows[0].id);
+            else
+                missing.push(labelName);
+        }
+        if (missing.length > 0) {
+            const known = await query(`SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY name`, [issueRows[0].workspace_id], instance);
+            throw new Error(`Label(s) not found: ${missing.join(', ')}. Nothing was changed. ` +
+                `Existing labels: ${known.map((r) => r.name).join(', ') || '(none)'}`);
+        }
+    }
+    // Resolve assignee name/email to UUID if provided
+    let assigneeIds;
+    if (updates.assignee !== undefined) {
+        if (updates.assignee === '') {
+            assigneeIds = []; // unassign
+        }
+        else {
+            const users = await query(
+            // ⛔ is_active AND a deterministic ORDER BY are BOTH load-bearing (fixed 2026-09-01).
+            // Before this the query was `... ILIKE $1 OR email ILIKE $1 LIMIT 1` with NO active filter and
+            // NO ordering, so "Isaac" matched both isaac@rirobinson.com AND the disabled duplicate
+            // isaac@versedhand.com, and Postgres returned whichever row it reached first. Result: 48 of his
+            // open tasks were assigned to a DISABLED account he cannot see or log into — 23 of them created
+            // AFTER a ticket was filed about the problem, because the ticket could not fix a resolver bug.
+            // Same shape for racquel (10 tasks). An unmatched name already throws, which is correct; the
+            // defect was matching the WRONG one silently.
+            `SELECT id FROM users WHERE (first_name ILIKE $1 OR email ILIKE $1) AND is_active = true
+         ORDER BY (email ILIKE $1) DESC, email LIMIT 1`, [`%${updates.assignee}%`], instance);
+            if (users.length > 0) {
+                // FIX 2026-08-02: this used to PRESERVE existing assignees and append, so the
+                // API path could never reassign — only accumulate. The SQL path already
+                // replaced (delete-then-insert), so the two paths disagreed about what
+                // `assignee` means. REPLACE is the correct semantic and now both agree.
+                assigneeIds = [users[0].id];
+            }
+            else {
+                throw new Error(`Assignee '${updates.assignee}' not found — nothing was changed. ` +
+                    `Use a name or email fragment that matches a workspace member.`);
+            }
+        }
+    }
+    // --- REST API path (preferred: triggers notifications) ---
+    if (hasApiConfig(instance)) {
+        const apiParams = {};
+        if (updates.name !== undefined)
+            apiParams.name = updates.name;
+        if (updates.priority !== undefined)
+            apiParams.priority = updates.priority;
+        // FIX 2026-08-02: update_issue exposed no description field, so an agent could
+        // not write findings back onto an issue and had to keep the record elsewhere.
+        if (updates.description !== undefined) {
+            apiParams.description_html = updates.description ? `<p>${updates.description}</p>` : '';
+        }
+        if (stateId !== undefined)
+            apiParams.state = stateId;
+        if (assigneeIds !== undefined)
+            apiParams.assignees = assigneeIds;
+        if (labelIds !== undefined)
+            apiParams.labels = labelIds;
+        if (updates.target_date !== undefined)
+            apiParams.target_date = updates.target_date || null;
+        if (updates.start_date !== undefined)
+            apiParams.start_date = updates.start_date || null;
+        await apiUpdateWorkItem(projectId, issueId, apiParams, instance);
+        const drift = await verifyIssueWrite(issueId, updates, instance);
+        if (drift.length > 0)
+            return `⚠ ${projectIdentifier}-${seqId} UPDATE DID NOT APPLY CLEANLY — verified by reading the row back: ${drift.join('; ')}. Re-check before relying on this.`;
+        return `Updated ${projectIdentifier}-${seqId} (verified)`;
+    }
+    // --- SQL fallback ---
+    const now = new Date().toISOString();
+    const setClauses = [`updated_at = $2`];
+    const params = [issueId, now];
+    let paramIdx = 3;
+    if (updates.name) {
+        setClauses.push(`name = $${paramIdx}`);
+        params.push(updates.name);
+        paramIdx++;
+    }
+    if (updates.priority) {
+        setClauses.push(`priority = $${paramIdx}`);
+        params.push(updates.priority);
+        paramIdx++;
+    }
+    if (updates.target_date !== undefined) {
+        setClauses.push(`target_date = $${paramIdx}`);
+        params.push(updates.target_date || null);
+        paramIdx++;
+    }
+    if (updates.start_date !== undefined) {
+        setClauses.push(`start_date = $${paramIdx}`);
+        params.push(updates.start_date || null);
+        paramIdx++;
+    }
+    if (updates.description !== undefined) {
+        const dTxt = updates.description || '';
+        const dHtml = dTxt ? `<p>${dTxt}</p>` : '';
+        const dJson = dTxt
+            ? JSON.stringify({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: dTxt }] }] })
+            : '{}';
+        setClauses.push(`description = $${paramIdx}::jsonb`);
+        params.push(dJson);
+        paramIdx++;
+        setClauses.push(`description_html = $${paramIdx}`);
+        params.push(dHtml);
+        paramIdx++;
+        setClauses.push(`description_stripped = $${paramIdx}`);
+        params.push(dTxt);
+        paramIdx++;
+    }
+    if (stateId) {
+        setClauses.push(`state_id = $${paramIdx}`);
+        params.push(stateId);
+        paramIdx++;
+        // Check if this is a completed state
+        const stateGroup = await query(`SELECT "group" FROM states WHERE id = $1`, [stateId], instance);
+        if (stateGroup.length > 0 && (stateGroup[0].group === 'completed' || stateGroup[0].group === 'cancelled')) {
+            setClauses.push(`completed_at = $${paramIdx}`);
+            params.push(now);
+            paramIdx++;
+        }
+    }
+    const result = await execute(`UPDATE issues SET ${setClauses.join(', ')} WHERE id = $1 AND deleted_at IS NULL`, params, instance);
+    if (updates.assignee !== undefined) {
+        await execute(`UPDATE issue_assignees SET deleted_at = $2 WHERE issue_id = $1 AND deleted_at IS NULL`, [issueId, now], instance);
+        if (updates.assignee) {
+            const users = await query(
+            // ⛔ is_active AND a deterministic ORDER BY are BOTH load-bearing (fixed 2026-09-01).
+            // Before this the query was `... ILIKE $1 OR email ILIKE $1 LIMIT 1` with NO active filter and
+            // NO ordering, so "Isaac" matched both isaac@rirobinson.com AND the disabled duplicate
+            // isaac@versedhand.com, and Postgres returned whichever row it reached first. Result: 48 of his
+            // open tasks were assigned to a DISABLED account he cannot see or log into — 23 of them created
+            // AFTER a ticket was filed about the problem, because the ticket could not fix a resolver bug.
+            // Same shape for racquel (10 tasks). An unmatched name already throws, which is correct; the
+            // defect was matching the WRONG one silently.
+            `SELECT id FROM users WHERE (first_name ILIKE $1 OR email ILIKE $1) AND is_active = true
+         ORDER BY (email ILIKE $1) DESC, email LIMIT 1`, [`%${updates.assignee}%`], instance);
+            if (users.length > 0) {
+                await execute(`INSERT INTO issue_assignees (id, issue_id, assignee_id, project_id, workspace_id, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $6)`, [randomUUID(), issueId, users[0].id, projectId, issueRows[0].workspace_id, now], instance);
+            }
+        }
+    }
+    if (labelIds !== undefined) {
+        await execute(`UPDATE issue_labels SET deleted_at = $2 WHERE issue_id = $1 AND deleted_at IS NULL`, [issueId, now], instance);
+        for (const lid of labelIds) {
+            await execute(`INSERT INTO issue_labels (id, issue_id, label_id, project_id, workspace_id, created_at, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $6)`, [randomUUID(), issueId, lid, projectId, issueRows[0].workspace_id, now], instance);
+        }
+    }
+    // Same read-back as the API path. `result` is a raw pg command tag ("UPDATE 1")
+    // and says nothing about whether the row now holds what was asked for.
+    const drift = await verifyIssueWrite(issueId, updates, instance);
+    if (drift.length > 0)
+        return `⚠ ${projectIdentifier}-${seqId} UPDATE DID NOT APPLY CLEANLY — verified by reading the row back: ${drift.join('; ')}. Re-check before relying on this. (${result})`;
+    return `Updated ${projectIdentifier}-${seqId} (verified)`;
+}
+export async function completeIssue(issueIds, instance = 'personal') {
+    const now = new Date().toISOString();
+    const results = [];
+    const useApi = hasApiConfig(instance);
+    for (const issueId of issueIds) {
+        const issue = await query(`SELECT i.id, i.name, i.project_id, p.identifier, i.sequence_id
+       FROM issues i JOIN projects p ON i.project_id = p.id
+       WHERE i.id = $1 AND i.deleted_at IS NULL`, [issueId], instance);
+        if (issue.length === 0) {
+            results.push(`${issueId}: not found`);
+            continue;
+        }
+        let states = await query(`SELECT id FROM states WHERE project_id = $1 AND deleted_at IS NULL
+       AND "group" = 'completed' ORDER BY sequence LIMIT 1`, [issue[0].project_id], instance);
+        if (states.length === 0) {
+            // Fallback: project has no states — search workspace-wide
+            const wsRows = await query(`SELECT workspace_id FROM issues WHERE id = $1`, [issueId], instance);
+            if (wsRows.length > 0) {
+                states = await query(`SELECT id FROM states WHERE workspace_id = $1 AND deleted_at IS NULL
+           AND "group" = 'completed' ORDER BY sequence LIMIT 1`, [wsRows[0].workspace_id], instance);
+            }
+        }
+        if (states.length === 0) {
+            results.push(`${issue[0].identifier}-${issue[0].sequence_id}: no completed state found`);
+            continue;
+        }
+        if (useApi) {
+            // REST API path — Plane handles completed_at automatically when state group is 'completed'
+            await apiUpdateWorkItem(issue[0].project_id, issueId, { state: states[0].id }, instance);
+        }
+        else {
+            // SQL fallback
+            await execute(`UPDATE issues SET state_id = $2, completed_at = $3, updated_at = $3
+         WHERE id = $1 AND deleted_at IS NULL`, [issueId, states[0].id, now], instance);
+        }
+        results.push(`${issue[0].identifier}-${issue[0].sequence_id}: ${issue[0].name} -> completed`);
+        // Check for recurrence rule in LifeDB
+        try {
+            const recurrenceResult = await processRecurrenceIfExists(issueId, instance);
+            if (recurrenceResult) {
+                results.push(`  ↳ Recurrence: ${recurrenceResult}`);
+            }
+        }
+        catch (err) {
+            results.push(`  ↳ Recurrence error: ${err.message}`);
+        }
+    }
+    return results.join('\n');
+}
+async function processRecurrenceIfExists(issueId, instance) {
+    const lifedb = getLifedbPool();
+    try {
+        const rows = await lifedb.query(`SELECT * FROM plane_recurrence WHERE plane_issue_id = $1 AND enabled = true`, [issueId]);
+        if (rows.rows.length === 0)
+            return null;
+        const rule = rows.rows[0];
+        return processRecurrence(rule);
+    }
+    catch (err) {
+        // Table may not exist yet (created on-demand when first recurrence rule is added)
+        if (err.message?.includes('does not exist')) {
+            return null;
+        }
+        throw err;
+    }
+}
+async function processRecurrence(rule) {
+    if (rule.recur_type === 'exercise_cycle') {
+        return handleExerciseCycle(rule);
+    }
+    // Get the current issue's target_date to calculate next due
+    const currentIssue = await query(`SELECT target_date FROM issues WHERE id = $1`, [rule.plane_issue_id], rule.plane_instance);
+    const currentDue = currentIssue.length > 0 && currentIssue[0].target_date
+        ? new Date(currentIssue[0].target_date)
+        : new Date();
+    const nextDue = calculateNextDue(rule, currentDue);
+    const nextDateStr = formatDate(nextDue);
+    // Create new issue in Plane
+    const result = await createIssue({
+        project: rule.plane_project_id,
+        name: rule.template_name,
+        priority: rule.template_priority,
+        description: rule.template_description || undefined,
+        target_date: nextDateStr,
+        instance: rule.plane_instance,
+    });
+    // Extract new issue ID from result
+    const idMatch = result.match(/id: ([0-9a-f-]+)/);
+    if (idMatch) {
+        const lifedb = getLifedbPool();
+        await lifedb.query(`UPDATE plane_recurrence SET plane_issue_id = $1, updated_at = NOW() WHERE id = $2`, [idMatch[1], rule.id]);
+    }
+    return `Next: ${rule.template_name} due ${nextDateStr}`;
+}
+async function handleExerciseCycle(rule) {
+    const nextType = rule.exercise_last_type === 'Push' ? 'Pull' : 'Push';
+    // Check if exercise was completed yesterday (streak detection)
+    const lifedb = getLifedbPool();
+    const yesterdayCheck = await query(`SELECT COUNT(*) as cnt FROM issues i
+     JOIN states s ON i.state_id = s.id
+     WHERE i.project_id = $1 AND i.deleted_at IS NULL
+     AND s.group = 'completed'
+     AND i.completed_at::date = CURRENT_DATE - 1
+     AND i.name LIKE 'Exercise%'`, [rule.plane_project_id], rule.plane_instance);
+    const hadYesterday = parseInt(yesterdayCheck[0]?.cnt || '0') > 0;
+    // Day 2+ of streak: rest day, due in 2 days. Day 1 or gap: due tomorrow.
+    const daysUntilNext = hadYesterday ? 2 : 1;
+    const nextDue = new Date();
+    nextDue.setDate(nextDue.getDate() + daysUntilNext);
+    const nextDateStr = formatDate(nextDue);
+    const newName = `Exercise — ${nextType}`;
+    const result = await createIssue({
+        project: rule.plane_project_id,
+        name: newName,
+        priority: rule.template_priority,
+        description: rule.template_description || undefined,
+        target_date: nextDateStr,
+        instance: rule.plane_instance,
+    });
+    const idMatch = result.match(/id: ([0-9a-f-]+)/);
+    if (idMatch) {
+        await lifedb.query(`UPDATE plane_recurrence
+       SET plane_issue_id = $1, exercise_last_type = $2,
+           exercise_streak = CASE WHEN $3 THEN exercise_streak + 1 ELSE 1 END,
+           updated_at = NOW()
+       WHERE id = $4`, [idMatch[1], nextType, hadYesterday, rule.id]);
+    }
+    const restNote = hadYesterday ? ' (rest day earned)' : '';
+    return `Next: ${newName} due ${nextDateStr}${restNote}`;
+}
+function calculateNextDue(rule, currentDue) {
+    const next = new Date(currentDue);
+    switch (rule.recur_type) {
+        case 'daily':
+            next.setDate(next.getDate() + 1);
+            break;
+        case 'interval':
+            next.setDate(next.getDate() + (rule.recur_interval_days || 7));
+            break;
+        case 'weekly':
+            next.setDate(next.getDate() + 7);
+            break;
+        case 'monthly':
+            next.setMonth(next.getMonth() + 1);
+            break;
+        default:
+            next.setDate(next.getDate() + 7);
+    }
+    return next;
+}
+function formatDate(d) {
+    return d.toISOString().split('T')[0];
+}
+// --- Tasks Due (cross-instance) ---
+export async function tasksDue(instance) {
+    const instances = instance === 'all' || !instance
+        ? getAvailableInstances()
+        : [instance];
+    const allLines = [];
+    for (const inst of instances) {
+        try {
+            const wsId = await getWorkspaceId(inst);
+            // No assignee filter: the tool contract is "all tasks due/overdue".
+            // A previous version filtered to assignee email isaac@rirobinson.com,
+            // which silently returned zero once NTS assignments moved to the
+            // isaac@versedhand.com user (and personal tasks were unassigned).
+            const rows = await query(`SELECT i.id, i.name, i.priority, i.sequence_id,
+                i.target_date,
+                s.name as state_name,
+                p.identifier as project_identifier,
+                COALESCE(
+                  (SELECT string_agg(u.first_name, ', ')
+                   FROM issue_assignees ia JOIN users u ON ia.assignee_id = u.id
+                   WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL),
+                  'unassigned'
+                ) as assignees
+         FROM issues i
+         JOIN states s ON i.state_id = s.id
+         JOIN projects p ON i.project_id = p.id
+         WHERE i.workspace_id = $1
+           AND i.deleted_at IS NULL AND i.archived_at IS NULL
+           AND s.group NOT IN ('completed', 'cancelled')
+           AND (i.target_date <= CURRENT_DATE OR i.target_date IS NULL)
+         ORDER BY
+           i.target_date NULLS LAST,
+           CASE i.priority
+             WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2
+             WHEN 'low' THEN 3 ELSE 4
+           END`, [wsId], inst);
+            for (const r of rows) {
+                const priority = r.priority === 'none' ? '' : `[${r.priority.toUpperCase()}] `;
+                // UNDATED items are included deliberately (Isaac ruled 2026-09-01: "due should include
+                // undated in case we miss them"). Before this, an item with no target_date could NEVER
+                // appear here -- and since every daily surfacing runs through tasksDue, 178 of his 220
+                // open items were structurally unreachable. Measured the day of the ruling.
+                const undated = r.target_date == null;
+                const overdue = !undated && r.target_date < new Date().toISOString().split('T')[0] ? ' OVERDUE' : '';
+                const dueField = undated ? 'NO DUE DATE' : `Due: ${r.target_date}${overdue}`;
+                allLines.push(`${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | ${r.assignees} | ${dueField} | ${r.state_name} [${inst}]`);
+            }
+        }
+        catch (err) {
+            allLines.push(`[ERROR ${inst}]: ${err.message}`);
+        }
+    }
+    if (allLines.length === 0)
+        return 'No tasks due today or overdue.';
+    return `${allLines.length} tasks due/overdue:\n` + allLines.join('\n');
+}
+export async function searchIssues(searchText, limit, instance = 'personal') {
+    const wsId = await getWorkspaceId(instance);
+    const maxResults = limit || 20;
+    const rows = await query(`SELECT i.id, i.name, i.priority, i.sequence_id,
+            i.target_date, i.completed_at,
+            s.name as state_name, s.group as state_group,
+            p.name as project_name, p.identifier as project_identifier,
+            COALESCE(
+              (SELECT string_agg(u.first_name, ', ')
+               FROM issue_assignees ia JOIN users u ON ia.assignee_id = u.id
+               WHERE ia.issue_id = i.id AND ia.deleted_at IS NULL),
+              'unassigned'
+            ) as assignees
+     FROM issues i
+     JOIN states s ON i.state_id = s.id
+     JOIN projects p ON i.project_id = p.id
+     WHERE i.workspace_id = $1 AND i.deleted_at IS NULL
+     AND (i.name ILIKE $2 OR i.description_stripped ILIKE $2)
+     ORDER BY
+       CASE WHEN i.name ILIKE $2 THEN 0 ELSE 1 END,
+       i.updated_at DESC
+     LIMIT $3`, [wsId, `%${searchText}%`, maxResults], instance);
+    if (rows.length === 0)
+        return `No issues matching '${searchText}'.`;
+    const lines = rows.map((r) => {
+        const priority = r.priority === 'none' ? '' : `[${r.priority.toUpperCase()}] `;
+        const due = r.target_date ? ` | Due: ${r.target_date}` : '';
+        return `${priority}${r.project_identifier}-${r.sequence_id}: ${r.name} | ${r.assignees}${due} | ${r.state_name}`;
+    });
+    return lines.join('\n');
+}
+export async function rawQuery(sql, instance = 'personal') {
+    const trimmed = sql.trim().toUpperCase();
+    const isRead = trimmed.startsWith('SELECT') || trimmed.startsWith('WITH') || trimmed.startsWith('EXPLAIN');
+    if (!isRead) {
+        return 'Error: query tool only supports SELECT/WITH/EXPLAIN statements. Use create_issue, update_issue, or complete_issue for mutations.';
+    }
+    const rows = await query(sql, undefined, instance);
+    if (rows.length === 0)
+        return 'No results.';
+    const columns = Object.keys(rows[0]);
+    const header = columns.join(' | ');
+    const separator = columns.map((c) => '-'.repeat(c.length)).join('-+-');
+    const dataRows = rows.map((r) => columns
+        .map((c) => {
+        const val = r[c];
+        if (val === null)
+            return 'NULL';
+        if (val instanceof Date)
+            return val.toISOString();
+        return String(val);
+    })
+        .join(' | '));
+    return [header, separator, ...dataRows].join('\n');
+}
+//# sourceMappingURL=queries.js.map

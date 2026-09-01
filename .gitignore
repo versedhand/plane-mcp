@@ -1,3 +1,12 @@
 node_modules/
 dist/
 .env
+
+# dist/ IS COMMITTED ON PURPOSE (2026-09-01). ~/.claude.json now runs
+# `node ~/projects/plane-mcp/dist/index.js` directly instead of `npx -y
+# @versedhand/plane-mcp`, because the npx cache was serving an Aug-13 tarball
+# of 1.3.1 that did NOT contain the is_active assignee fix — so rebuilding dist
+# changed nothing that executed, and every session kept assigning tickets to a
+# disabled account. dist is now the RUNTIME, so a clone without it leaves the
+# Plane MCP dead on a fresh machine.
+!dist/
