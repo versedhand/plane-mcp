@@ -157,7 +157,15 @@ server.tool(
     assignee: z.string().optional().describe('New assignee name or email — REPLACES the current assignee (empty string unassigns). An unmatched name fails the call.'),
     target_date: z.string().optional().describe('New due date (YYYY-MM-DD, empty string to clear)'),
     start_date: z.string().optional().describe('New start date (YYYY-MM-DD, empty string to clear)'),
-    description: z.string().optional().describe('New description (plain text; empty string clears it)'),
+    description: z.string().optional().describe(
+      'New description (plain text) — ⛔ REPLACES THE ENTIRE DESCRIPTION. There is no append or '
+      + 'prepend semantic: the body is rebuilt from this string and the existing value is never read. '
+      + 'To add a line (e.g. a REVIEWED: stamp) you MUST read the current description with get_issue '
+      + 'first and pass the whole thing back, or use ~/projects/scripts/plane-stamp.py which does that '
+      + 'for you. ⚠️ The write is NOT read back for this field, so a call that destroys the body still '
+      + 'returns "(verified)", and the SQL path writes no issue_activities row — there is no undo. '
+      + 'Empty string clears it.',
+    ),
     labels: z.array(z.string()).optional().describe('Label names — REPLACES all labels on the issue. Must already exist; an unknown label fails the call. Pass [] to clear.'),
     instance: instanceParam,
   },
