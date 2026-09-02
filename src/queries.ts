@@ -320,9 +320,18 @@ export async function createIssue(opts: {
   const missingLabels: string[] = [];
   if (opts.labels && opts.labels.length > 0) {
     for (const labelName of opts.labels) {
+      // ⛔ project_id IS LOAD-BEARING (added 2026-09-01). Plane labels are PER-PROJECT,
+      // and this lookup was workspace-scoped with LIMIT 1 and no ORDER BY — so a name
+      // that exists in several projects resolved to whichever row Postgres returned
+      // first, and a name that exists in ANOTHER project resolved to that project's
+      // label instead of failing. MEASURED: NTS-841 was created carrying CMT's
+      // `agent:auto`, and PRJ-141 carries DLY's `research-review`. The read-back below
+      // compares label NAMES, so it reports success on a wrong-UUID write and is
+      // structurally blind to this. Same shape as the assignee resolver fixed earlier
+      // the same day, fifteen lines away in this file.
       const lblRows = await query(
-        `SELECT id FROM labels WHERE workspace_id = $1 AND name ILIKE $2 AND deleted_at IS NULL LIMIT 1`,
-        [wsId, labelName],
+        `SELECT id FROM labels WHERE workspace_id = $1 AND project_id = $2 AND name ILIKE $3 AND deleted_at IS NULL LIMIT 1`,
+        [wsId, projectId, labelName],
         inst,
       );
       if (lblRows.length > 0) labelIds.push(lblRows[0].id);
@@ -330,14 +339,14 @@ export async function createIssue(opts: {
     }
     if (missingLabels.length > 0) {
       const known = await query(
-        `SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY name`,
-        [wsId],
+        `SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND project_id = $2 AND deleted_at IS NULL ORDER BY name`,
+        [wsId, projectId],
         inst,
       );
       throw new Error(
         `Label(s) not found: ${missingLabels.join(', ')}. ` +
           `Nothing was created — fix the label name or create the label first, then retry. ` +
-          `Existing labels in this workspace: ${known.map((r: any) => r.name).join(', ') || '(none)'}`,
+          `Existing labels IN THIS PROJECT: ${known.map((r: any) => r.name).join(', ') || '(none)'}`,
       );
     }
   }
@@ -587,9 +596,12 @@ export async function updateIssue(
     labelIds = [];
     const missing: string[] = [];
     for (const labelName of updates.labels) {
+      // ⛔ project_id IS LOAD-BEARING — see the note at the createIssue call site.
+      // Labels are per-project; a workspace-wide lookup silently attaches another
+      // project's label and the name-based read-back cannot see it.
       const rows = await query(
-        `SELECT id FROM labels WHERE workspace_id = $1 AND name ILIKE $2 AND deleted_at IS NULL LIMIT 1`,
-        [issueRows[0].workspace_id, labelName],
+        `SELECT id FROM labels WHERE workspace_id = $1 AND project_id = $2 AND name ILIKE $3 AND deleted_at IS NULL LIMIT 1`,
+        [issueRows[0].workspace_id, issueRows[0].project_id, labelName],
         instance,
       );
       if (rows.length > 0) labelIds.push(rows[0].id);
@@ -597,8 +609,8 @@ export async function updateIssue(
     }
     if (missing.length > 0) {
       const known = await query(
-        `SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND deleted_at IS NULL ORDER BY name`,
-        [issueRows[0].workspace_id],
+        `SELECT DISTINCT name FROM labels WHERE workspace_id = $1 AND project_id = $2 AND deleted_at IS NULL ORDER BY name`,
+        [issueRows[0].workspace_id, issueRows[0].project_id],
         instance,
       );
       throw new Error(
