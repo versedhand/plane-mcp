@@ -97,7 +97,10 @@ export function getLifedbPool() {
             lifedbPool = new Pool({
                 host: process.env.LIFEDB_HOST || 'localhost',
                 port: parseInt(process.env.LIFEDB_PORT || '5432', 10),
-                user: process.env.LIFEDB_USER || 'postgres',
+                // No default (2026-11-20): 'postgres' was the superuser, inherited by any session whose shell
+                // sourced the superuser env. Unset now throws; complete_issue already catches recurrence errors.
+                user: (() => { const u = process.env.LIFEDB_USER; if (!u)
+                    throw new Error('LIFEDB_USER not set — refusing to default to the postgres superuser'); return u; })(),
                 password: process.env.LIFEDB_PASSWORD,
                 database: process.env.LIFEDB_NAME || 'lifedb',
                 max: 3,
