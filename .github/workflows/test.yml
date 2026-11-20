@@ -1,0 +1,18 @@
+# Live SQL-path tests against a THROWAWAY Postgres (scripts/test-live-local.sh): never a real Plane.
+# Added 2026-11-20 (arch-defect-sweep N078): 13 of 17 tests used to skip everywhere but production.
+name: test
+on:
+  push:
+  pull_request:
+jobs:
+  live-local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run test:live-local

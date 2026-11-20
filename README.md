@@ -136,3 +136,19 @@ ssh -f -N -L 15432:<container-ip>:5432 root@<proxmox-host>
 ```
 
 Then set `PLANE_DB_PORT=15432`.
+
+## Testing
+
+`npm test` runs the pure-logic tests and skips the live-DB ones unless Plane DB env is set. Do not point that
+env at a real instance: the live tests create issues. Instead run
+
+```bash
+npm run test:live-local    # docker required
+```
+
+which starts a throwaway `postgres:15` on 127.0.0.1, loads the structure of the Plane tables this package
+touches (`test/fixtures/plane-schema.sql`, no data), seeds synthetic fixtures, and runs every test including
+the write-path regressions (label scoped to its project, emptied `target_date` not completing an issue,
+state change stamping `completed_at`). It forces every DB host to 127.0.0.1 and unsets the API env.
+`prepublishOnly` and the GitHub workflow run it. After a Plane upgrade, refresh the fixture with
+`pg_dump --schema-only --no-owner --no-privileges -t <the 11 tables>` (structure only).

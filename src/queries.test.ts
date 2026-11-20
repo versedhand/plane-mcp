@@ -11,7 +11,7 @@
  */
 
 import { describe, it, expect, afterAll } from 'vitest';
-import { listProjects, listIssues, getIssue, searchIssues, rawQuery, tasksDue, createIssue, completeIssue } from './queries.js';
+import { listProjects, listIssues, getIssue, searchIssues, rawQuery, tasksDue, createIssue, completeIssue, updateIssue } from './queries.js';
 import { shutdown, getPool, getLifedbPool } from './db.js';
 import type { InstanceName } from './db.js';
 
@@ -226,5 +226,50 @@ describeLive('createIssue', () => {
       const pool = getPool('personal');
       await pool.query("UPDATE issues SET deleted_at = NOW() WHERE id = $1", [testIssueId]);
     }
+  });
+});
+
+// ⭐ WRITE-PATH REGRESSIONS (2026-11-20, arch-defect-sweep N078). The two silent-failure defects this
+// package shipped, plus the cross-project label bug, asserted against the SQL path. Run them only on the
+// throwaway DB (scripts/test-live-local.sh sets PLANE_MCP_THROWAWAY_DB=1): they write and do not clean up.
+const describeThrowaway = HAS_PLANE_CREDS && process.env.PLANE_MCP_THROWAWAY_DB === '1' ? describe : describe.skip;
+
+describeThrowaway('write-path regressions (throwaway DB only)', () => {
+  const idOf = (r: string) => r.match(/id: ([0-9a-f-]+)/)![1];
+
+  it('attaches a label that exists in the project', async () => {
+    const r = await createIssue({ project: 'PRJ', name: 'labelled', labels: ['urgent'], instance: 'personal' });
+    expect(r).not.toMatch(/NOT ATTACHED/);
+    expect(await getIssue(idOf(r), 'personal')).toMatch(/Labels: urgent/);
+  });
+
+  it('refuses a label that exists only in ANOTHER project, and creates nothing', async () => {
+    const pool = getPool('personal');
+    const before = await pool.query("SELECT count(*)::int AS n FROM issues i JOIN projects p ON p.id = i.project_id WHERE p.identifier = 'PRJ'");
+    await expect(createIssue({ project: 'PRJ', name: 'wrong label', labels: ['recurring'], instance: 'personal' }))
+      .rejects.toThrow(/Label\(s\) not found: recurring/);
+    const after = await pool.query("SELECT count(*)::int AS n FROM issues i JOIN projects p ON p.id = i.project_id WHERE p.identifier = 'PRJ'");
+    expect(after.rows[0].n).toBe(before.rows[0].n);
+  });
+
+  it('clearing target_date leaves the issue open (not Done) and reports verified', async () => {
+    const r = await createIssue({ project: 'PRJ', name: 'dated', target_date: '2099-12-31', instance: 'personal' });
+    const id = idOf(r);
+    const u = await updateIssue(id, { target_date: '' }, 'personal');
+    expect(u).toMatch(/\(verified\)/);
+    const row = await getPool('personal').query(
+      'SELECT i.target_date, s."group" AS g FROM issues i JOIN states s ON s.id = i.state_id WHERE i.id = $1', [id]);
+    expect(row.rows[0].target_date).toBeNull();
+    expect(row.rows[0].g).not.toBe('completed');
+  });
+
+  it('a state change to Done is applied and stamps completed_at', async () => {
+    const r = await createIssue({ project: 'PRJ', name: 'to finish', instance: 'personal' });
+    const id = idOf(r);
+    expect(await updateIssue(id, { state: 'Done' }, 'personal')).toMatch(/\(verified\)/);
+    const row = await getPool('personal').query(
+      'SELECT i.completed_at, s."group" AS g FROM issues i JOIN states s ON s.id = i.state_id WHERE i.id = $1', [id]);
+    expect(row.rows[0].g).toBe('completed');
+    expect(row.rows[0].completed_at).not.toBeNull();
   });
 });
