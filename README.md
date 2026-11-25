@@ -152,3 +152,19 @@ the write-path regressions (label scoped to its project, emptied `target_date` n
 state change stamping `completed_at`). It forces every DB host to 127.0.0.1 and unsets the API env.
 `prepublishOnly` and the GitHub workflow run it. After a Plane upgrade, refresh the fixture with
 `pg_dump --schema-only --no-owner --no-privileges -t <the 11 tables>` (structure only).
+
+## Releasing
+
+Publishing is npm **Trusted Publishing** (OIDC from GitHub Actions); there is no npm token in this repo or its
+secrets. Bump and tag, then push the tag:
+
+```bash
+npm version patch          # commits package.json + lockfile and tags vX.Y.Z
+git push --follow-tags
+```
+
+The tag runs `.github/workflows/publish.yml`, which checks the tag equals `package.json`'s version and runs
+`npm publish --provenance` (so `prepublishOnly`: build + the live-local suite). npm accepts it because the
+package's Settings → Trusted Publisher names `versedhand/plane-mcp` and workflow `publish.yml`; renaming the
+workflow file breaks publishing until that entry is recreated. Each published version carries a provenance
+attestation (`npm view @versedhand/plane-mcp dist.attestations`).
