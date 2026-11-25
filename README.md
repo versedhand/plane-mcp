@@ -156,7 +156,9 @@ state change stamping `completed_at`). It forces every DB host to 127.0.0.1 and 
 ## Releasing
 
 Publishing is npm **Trusted Publishing** (OIDC from GitHub Actions); there is no npm token in this repo or its
-secrets. Bump and tag, then push the tag:
+secrets. ⚠️ **Status 2026-11-25: the workflow is in place but the npmjs.com Trusted Publisher entry is not yet**
+**created** (npm requires account 2FA on the publishing account first), so a tag push will fail at `npm publish`
+until it is. Bump and tag, then push the tag:
 
 ```bash
 npm version patch          # commits package.json + lockfile and tags vX.Y.Z
